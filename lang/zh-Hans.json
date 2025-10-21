@@ -1,0 +1,22 @@
+{
+    "PluginName": "金手指Zing",
+    "LoadFailedLoadCacheFromFileDmntCheatEntryText": "加载失败",
+    "CodeBiggerThanBookmarkErrorAddBookmarkCheatsLabelsStrText": "此代码所需地址空间大于书签上所创建的！\n",
+    "CheatWrongWidthValueProcessErrorAddBookmarkCheatsLabelsStrText": "金手指代码处理错误，宽度值错误\n",
+    "AddPointerChainToBookmarkErrorAddBookmarkCheatsLabelsStrText": "将金手指指针链添加到书签\n",
+    "NoAvailableCheatsErrorGetCheatsCheatsEnableStrText": "没有可用的金手指代码\n",
+    "BasicInfoGetCheatsCheatsCursorText": "金手指ID = %d，启用总数 = %d/%ld\n",
+    "PressKeyForComboCountGetCheatsCheatsLabelsStrText": "组合按键计数 = %d\n",
+    "OutlineClosedGetCheatsCheatsLabelsStrText": "- 大纲关闭 - [%s]\n",
+    "EnabledCheatsGetCheatsCheatsLabelsStrText": "已启用的金手指 %d\n",
+    "ShowTotalInfoGetCheatsCheatsCursorText": "金手指 %d/%ld 操作码 = %d 总操作码 = %d/%d\n",
+    "UpdateStatusTitleStrBookmarkOverlayCustomDrawerText": "\uE0A6+\uE0A4/\uE0A5 字体大小  \uE0A6+\uE0A3 编辑  \uE0C4+\uE0C5 退出\n",
+    "GameNotRunningMainMenuListItemText": "游戏没有运行",
+    "NoDmntMainMenuListItemText": "Dmnt没有附加",
+    "UpdateCursorNoCheatsMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\n\n\n",
+    "UpdateCursorOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090 浏览\n\uE0A4 \uE0A5 修改  \uE0A0 编辑  \uE0A1 退出  \uE0A6+\uE0A4/\uE0A5 字体大小  \uE0B4 删除\n\uE0A6+\uE04E 切换显示所有项  \uE0A3 查找下一个启用项\n",
+    "UpdateCursorNotOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090\uE0A4\uE0A5 浏览\n\uE0A0 切换  \uE0B3 添加书签  \uE0B4 删除书签  \uE0A1 退出\n\n",
+    "UpdateBookmarkPressKeyForComboCountMainMenuCustomDrawerText": "组合按键计数 = %d\n",
+    "UpdateEditCheatValueMainMenuCustomDrawerText": "\uE092\uE093\uE0A4\uE0A5 \uE0A0 选择  \uE0A1 退格  \uE045 回车  \uE0A2 取消\n",
+    "UpdateShowOutlineCursorMainMenuCustomDrawerText": "金手指大纲 \uE092\uE093 \uE0A0 选择\n"
+}

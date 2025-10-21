@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  issue_comment:
+    types: [ created ]
+
+jobs:
+  build_and_release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    if: contains(github.event.comment.body, '/release-action')
+
+    steps:
+      - name: Update latest libnx
+        run: |
+          git config --global --add safe.directory "*"
+          git clone --recurse-submodules https://github.com/zdm65477730/libnx.git
+          cd libnx
+          make install -j$(nproc)
+        shell: bash
+      - name: Checkout latest code
+        uses: actions/checkout@v4.2.2
+        if: contains(github.event.comment.body, '/release-action')
+        with:
+          ref: master
+          clean: true
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Setup ENV parameters
+        run: |
+          VER_FILE=Makefile
+          NAME=$(awk '/^APP_TITLE/{print $3}' $VER_FILE)
+          VERSION=$(awk '/^APP_VERSION/{print $3}' $VER_FILE)
+          echo "TAG=${VERSION}" >> "${GITHUB_ENV}"
+          echo "APP_NAME=${NAME}" >> "${GITHUB_ENV}"
+          echo "RELEASE_NAME=${NAME} ${VERSION}" >> "${GITHUB_ENV}"
+        shell: bash
+      - name: Build
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          make all
+        shell: bash
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2.0.9
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ env.TAG }}
+          draft: false
+          prerelease: false
+          generate_release_notes: yes
+          make_latest: true
+          files: |
+            ./SdOut/${{ env.APP_NAME }}.zip
