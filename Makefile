@@ -171,9 +171,11 @@ $(BUILD):
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 	@rm -rf $(CURDIR)/SdOut
 	@mkdir -p $(CURDIR)/SdOut/switch/.overlays/lang/$(APP_TITLE)
+	@mkdir -p $(CURDIR)/SdOut/config/$(APP_TITLE)
 	@cp -r $(TARGET).ovl $(CURDIR)/SdOut/switch/.overlays/
 	@cp -r $(CURDIR)/lang/* $(CURDIR)/SdOut/switch/.overlays/lang/$(APP_TITLE)/
-	@cd $(CURDIR)/SdOut; zip -r -q -9 $(APP_TITLE).zip switch; cd $(CURDIR)
+	@cp -r $(CURDIR)/config/* $(CURDIR)/SdOut/config/$(APP_TITLE)/
+	@cd $(CURDIR)/SdOut; zip -r -q -9 $(APP_TITLE).zip switch config; cd $(CURDIR)
 
 #---------------------------------------------------------------------------------
 clean:

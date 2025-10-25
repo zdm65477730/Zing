@@ -4,6 +4,7 @@
 #include "debugger.hpp"
 #include "dmntcht.h"
 #include "memory_dump.hpp"
+#include "utils.hpp"
 
 using namespace tsl;
 
@@ -1327,6 +1328,12 @@ void getcheats() {
 }
 
 class BookmarkOverlay : public tsl::Gui {
+private:
+	uint64_t bookmarkEnableCheatCombo = MapButtons(strBookmarkEnableCheatCombo);
+    uint64_t bookmarkPauseCheatCombo = MapButtons(strBookmarkPauseCheatCombo);
+    uint64_t bookmarkIncreaseFontSizeCombo = MapButtons(strBookmarkIncreaseFontSizeCombo);
+    uint64_t bookmarkDecreaseFontSizeCombo = MapButtons(strBookmarkDecreaseFontSizeCombo);
+
 public:
     BookmarkOverlay() {}
 
@@ -1460,7 +1467,7 @@ public:
                 refresh_cheats = true;
             }
         }
-        if ((keysHeld & HidNpadButton_StickL) && (keysHeld & HidNpadButton_StickR)) {
+        if (isKeyComboPressed(keysHeld, keysDown, bookmarkEnableCheatCombo)) {
             m_cheatlist_offset = m_cheatlist_offset_save;
             TeslaFPS = 50;
             IsFrameBackground = false;
@@ -1470,7 +1477,7 @@ public:
             tsl::goBack();
             return true;
         }
-        if (keysDown & HidNpadButton_Y && keysHeld & HidNpadButton_ZL) {
+        if (isKeyComboPressed(keysHeld, keysDown, bookmarkPauseCheatCombo)) {
             m_cheatlist_offset = m_cheatlist_offset_save;
             TeslaFPS = 50;
             IsFrameBackground = false;
@@ -1481,11 +1488,11 @@ public:
             tsl::goBack();
             return true;
         }
-        if (keysDown & HidNpadButton_R && keysHeld & HidNpadButton_ZL) {
+        if (isKeyComboPressed(keysHeld, keysDown, bookmarkIncreaseFontSizeCombo)) {
             fontsize++;
             return true;
         }
-        if (keysDown & HidNpadButton_L && keysHeld & HidNpadButton_ZL) {
+        if (isKeyComboPressed(keysHeld, keysDown, bookmarkDecreaseFontSizeCombo)) {
             fontsize--;
             return true;
         }
@@ -1495,6 +1502,14 @@ public:
 
 //Main Menu
 class MainMenu : public tsl::Gui {
+private:
+	uint64_t mainMenuChangeToBookmarkCombo = MapButtons(strMainMenuChangeToBookmarkCombo);
+    uint64_t mainMenuIncreaseFontSizeCombo = MapButtons(strMainMenuIncreaseFontSizeCombo);
+    uint64_t mainMenuDecreaseFontSizeCombo = MapButtons(strMainMenuDecreaseFontSizeCombo);
+    uint64_t mainMenuOutlineModeSwitchesCombo = MapButtons(strMainMenuOutlineModeSwitchesCombo);
+    uint64_t mainMenuSetBookmarkMultipier = MapButtons(strMainMenuSetBookmarkMultipier);
+    uint64_t mainMenuNextLabel = MapButtons(strMainMenuNextLabel);
+    uint64_t mainMenuPreviousLabel = MapButtons(strMainMenuPreviousLabel);
 public:
     MainMenu() {}
     ~MainMenu() {
@@ -1725,7 +1740,11 @@ public:
             return true;
         }
 
+<<<<<<< HEAD
 		if (!m_cheatCnt) {
+=======
+        if (!m_cheatCnt) {
+>>>>>>> d176a10 (add key combo configuration)
             if (keysDown & HidNpadButton_B) {
                 tsl::goBack();
             }
@@ -1895,7 +1914,7 @@ public:
             };
             return true;
         }
-        if (keysDown & HidNpadButton_Y && keysHeld & HidNpadButton_ZL) {
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuChangeToBookmarkCombo)) {
             TeslaFPS = 20;
             IsFrameBackground = false;
             tsl::hlp::requestForeground(false);
@@ -1912,11 +1931,11 @@ public:
             save_breeze_action_to_file = false;
             m_cheatlist_offset_save = m_cheatlist_offset;
         }
-        if (keysDown & HidNpadButton_R && keysHeld & HidNpadButton_ZL) { // font size++
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuIncreaseFontSizeCombo)) { // font size++
             fontsize++;
             return true;
         }
-        if (keysDown & HidNpadButton_L && keysHeld & HidNpadButton_ZL) { // font size--
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuDecreaseFontSizeCombo)) { // font size--
             fontsize--;
             return true;
         }
@@ -1948,7 +1967,7 @@ public:
             }
             return true;
         }
-        if (keysDown & HidNpadButton_X && !(keysHeld & HidNpadButton_ZL)) { // force switch to outline mode
+        if (keysDown & HidNpadButton_X && !(isInKeyComboList(keysHeld, keysDown))) { // force switch to outline mode
             if (m_outline_mode) return true;
             if (m_outline.size() > 1) {
                 m_showALlCheats = !m_showALlCheats;
@@ -1957,7 +1976,7 @@ public:
             }
             return true;
         }
-        if (keysDown & HidNpadButton_X && (keysHeld & HidNpadButton_ZL)) { // switch to outline/non-outline mode
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuOutlineModeSwitchesCombo)) { // switch to outline/non-outline mode
             m_outline_mode = !m_outline_mode;
             if (m_outline_mode) {
                 m_showALlCheats = true;
@@ -2049,7 +2068,7 @@ public:
             m_edit_value = true;
             return true;
         }
-        if ((keysDown & HidNpadButton_Plus) && !(keysHeld & HidNpadButton_ZL) && !m_cursor_on_bookmark) { // add bookmark
+        if ((keysDown & HidNpadButton_Plus) && !(isInKeyComboList(keysHeld, keysDown)) && !m_cursor_on_bookmark) { // add bookmark
             addbookmark();
             return true;
         }
@@ -2141,7 +2160,7 @@ public:
             }
             return true;
         }
-        if (((keysDown & HidNpadButton_L) || (keysDown & HidNpadButton_R)) && m_cursor_on_bookmark) { // set bookmark multipier
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuSetBookmarkMultipier) && m_cursor_on_bookmark) { // set bookmark multipier
             bookmark_t bookmark;
             m_AttributeDumpBookmark->getData((m_index + m_addresslist_offset) * sizeof(bookmark_t), &bookmark, sizeof(bookmark_t));
             if (bookmark.magic!=0x1289) bookmark.multiplier = 1;
@@ -2226,7 +2245,7 @@ public:
             refresh_cheats = true;
             return true;
         }
-        if (keysDown & HidNpadButton_R && (keysHeld & HidNpadButton_ZR)) {  // Next label
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuNextLabel)) {  // Next label
             if (m_outline_mode) {
                 auto i = m_cheat_index + m_cheatlist_offset;
                 while (i < m_cheat_outline.size()) {
@@ -2239,7 +2258,7 @@ public:
             }
             return true;
         }
-        if (keysDown & HidNpadButton_L && (keysHeld & HidNpadButton_ZR)) {  // Previous label
+        if (isKeyComboPressed(keysHeld, keysDown, mainMenuPreviousLabel)) {  // Previous label
             if (m_outline_mode) {
                 auto i = m_cheat_index + m_cheatlist_offset;
                 while (i > 0) {
@@ -2257,7 +2276,7 @@ public:
             }
             return true;
         }
-        if (keysDown & HidNpadButton_R && !(keysHeld & HidNpadButton_ZR)) {  //page down
+        if (keysDown & HidNpadButton_R && !(isInKeyComboList(keysHeld, keysDown))) {  //page down
             if (m_outline_mode) {
                 if ((m_cheatlist_offset + NUM_cheats) < m_cheat_outline.size() - 1) m_cheatlist_offset += NUM_cheats;
                 if ((m_cheat_index + m_cheatlist_offset) > m_cheat_outline.size() - 1) m_cheat_index = m_cheat_outline.size() - 1 - m_cheatlist_offset;
@@ -2279,7 +2298,7 @@ public:
             };
             return true;
         }
-        if (keysDown & HidNpadButton_L && !(keysHeld & HidNpadButton_ZR)) {  //page up
+        if (keysDown & HidNpadButton_L && !(isInKeyComboList(keysHeld, keysDown))) {  //page up
             if (!m_cursor_on_bookmark && (m_outline.size() <= 1 || m_showALlCheats)) {
                 if (m_cheatlist_offset > NUM_cheats)
                     m_cheatlist_offset -= NUM_cheats;
@@ -2358,5 +2377,9 @@ class MonitorOverlay : public tsl::Overlay {
 
 // This function gets called on startup to create a new Overlay object
 int main(int argc, char **argv) {
+    tsl::hlp::doWithSDCardHandle([] {
+		ParseIniFile();
+	});
+
     return tsl::loop<MonitorOverlay>(argc, argv);
 }
