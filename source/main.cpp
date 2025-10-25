@@ -1725,6 +1725,13 @@ public:
             return true;
         }
 
+		if (!m_cheatCnt) {
+            if (keysDown & HidNpadButton_B) {
+                tsl::goBack();
+            }
+            return true;
+        }
+
         static u32 keycode;
         u32 redirect_index = m_cheat_index + m_cheatlist_offset;
         if (m_outline_mode) redirect_index = m_cheat_outline[redirect_index].index;
@@ -2184,7 +2191,7 @@ public:
             m_AttributeDumpBookmark->putData((m_index + m_addresslist_offset) * sizeof(bookmark_t), &bookmark, sizeof(bookmark_t));
             return true;
         }
-        if ((keysDown & HidNpadButton_A) && !m_cursor_on_bookmark) { //*** toggle cheats / expand outline
+        if ((keysDown & HidNpadButton_A) && m_cheatCnt > 0 && !m_cursor_on_bookmark) { //*** toggle cheats / expand outline
             u32 index = m_cheat_index + m_cheatlist_offset;
             if (m_outline_mode) {
                 auto entry = m_cheat_outline[index];
