@@ -1740,11 +1740,7 @@ public:
             return true;
         }
 
-<<<<<<< HEAD
 		if (!m_cheatCnt) {
-=======
-        if (!m_cheatCnt) {
->>>>>>> d176a10 (add key combo configuration)
             if (keysDown & HidNpadButton_B) {
                 tsl::goBack();
             }
