@@ -184,18 +184,34 @@ uint64_t MapButtons(const std::string& buttonCombo) {
 	return comboBitmask;
 }
 
-ALWAYS_INLINE bool isKeyComboPressed(uint64_t keysHeld, uint64_t keysDown, uint64_t comboBitmask) {
-	return (keysDown == comboBitmask) || (keysHeld == comboBitmask);
+/**
+ * @brief 判断组合键是否处于“当前所有按键都按下”的状态（覆盖所有场景）
+ * 
+ * @param keysDown 当前帧新按下的按键（位掩码）
+ * @param keysHeld 已持续按住超过1帧的按键（位掩码）
+ * @param comboBitmask 目标组合键（如 KEY_A | KEY_B | KEY_L）
+ * @return true 组合键所有按键当前都按下（无论新按还是持续按）；false 未满足
+ */
+ALWAYS_INLINE bool isKeyComboPressed(u64 keysDown, u64 keysHeld, u64 comboBitmask) {
+	return (((keysDown | keysHeld) & comboBitmask) == comboBitmask) &&
+		!((keysDown | keysHeld) & ~comboBitmask);
 }
 
-ALWAYS_INLINE bool isInKeyComboList(uint64_t keysHeld, uint64_t keysDown) {
-	return (keysDown == MapButtons(strMainMenuChangeToBookmarkCombo) || keysHeld == MapButtons(strMainMenuChangeToBookmarkCombo)) ||
-		(keysDown == MapButtons(strMainMenuIncreaseFontSizeCombo) || keysHeld == MapButtons(strMainMenuIncreaseFontSizeCombo)) ||
-		(keysDown == MapButtons(strMainMenuDecreaseFontSizeCombo) || keysHeld == MapButtons(strMainMenuDecreaseFontSizeCombo)) ||
-		(keysDown == MapButtons(strMainMenuOutlineModeSwitchesCombo) || keysHeld == MapButtons(strMainMenuOutlineModeSwitchesCombo)) ||
-		(keysDown == MapButtons(strMainMenuSetBookmarkMultipier) || keysHeld == MapButtons(strMainMenuSetBookmarkMultipier)) ||
-		(keysDown == MapButtons(strMainMenuNextLabel) || keysHeld == MapButtons(strMainMenuNextLabel)) ||
-		(keysDown == MapButtons(strMainMenuPreviousLabel) || keysHeld == MapButtons(strMainMenuPreviousLabel));
+/**
+ * @brief 检查在已知keysDown包含部分组合键的情况下，keysHeld是否包含剩余必要按键
+ * 
+ * @param keysDown 当前帧新按下的键（已知包含组合键中的部分按键）
+ * @param keysHeld 已持续按住超过1帧的键
+ * @return true 组合键的所有按键要么在keysDown中，要么在keysHeld中（组合完整）；false 不完整
+ */
+ALWAYS_INLINE bool isInKeyComboList(const u64 keysDown, const u64 keysHeld) {
+    return (keysHeld & (MapButtons(strMainMenuChangeToBookmarkCombo) & ~keysDown)) == (MapButtons(strMainMenuChangeToBookmarkCombo) & ~keysDown) ||
+		(keysHeld & (MapButtons(strMainMenuIncreaseFontSizeCombo) & ~keysDown)) == (MapButtons(strMainMenuIncreaseFontSizeCombo) & ~keysDown) ||
+		(keysHeld & (MapButtons(strMainMenuDecreaseFontSizeCombo) & ~keysDown)) == (MapButtons(strMainMenuDecreaseFontSizeCombo) & ~keysDown) ||
+		(keysHeld & (MapButtons(strMainMenuOutlineModeSwitchesCombo) & ~keysDown)) == (MapButtons(strMainMenuOutlineModeSwitchesCombo) & ~keysDown) ||
+		(keysHeld & (MapButtons(strMainMenuSetBookmarkMultipier) & ~keysDown)) == (MapButtons(strMainMenuSetBookmarkMultipier) & ~keysDown) ||
+		(keysHeld & (MapButtons(strMainMenuNextLabel) & ~keysDown)) == (MapButtons(strMainMenuNextLabel) & ~keysDown) ||
+		(keysHeld & (MapButtons(strMainMenuPreviousLabel) & ~keysDown)) == (MapButtons(strMainMenuPreviousLabel) & ~keysDown);
 }
 
 void ParseIniFile() {
