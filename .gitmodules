@@ -3,4 +3,4 @@
 	url = https://github.com/zdm65477730/libtesla
 [submodule "lib/Atmosphere-libs"]
 	path = lib/Atmosphere-libs
-	url = https://github.com/zdm65477730/Atmosphere-libs
+	url = https://github.com/Atmosphere-NX/Atmosphere-libs.git
