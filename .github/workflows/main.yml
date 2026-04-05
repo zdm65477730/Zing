@@ -20,7 +20,7 @@ jobs:
           make install -j$(nproc)
         shell: bash
       - name: Checkout latest code
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v6.0.2
         if: contains(github.event.comment.body, '/release-action')
         with:
           ref: master
@@ -43,7 +43,7 @@ jobs:
           make all
         shell: bash
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2.0.9
+        uses: softprops/action-gh-release@v2.6.1
         with:
           name: ${{ env.RELEASE_NAME }}
           tag_name: ${{ env.TAG }}
