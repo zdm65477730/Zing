@@ -38,7 +38,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
 APP_TITLE	:=	Zing
-APP_VERSION	:=	v0.5.0
+APP_VERSION	:=	v0.5.1
 TARGET		:=	$(APP_TITLE)
 BUILD		:=	build
 SOURCES		:=	source lib/Atmosphere-libs/libstratosphere/source/dmnt
