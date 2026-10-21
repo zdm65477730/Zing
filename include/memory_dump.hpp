@@ -7,7 +7,6 @@
 extern bool print_details;
 extern std::string m_edizon_dir; 
 extern std::string m_store_extension;
-// extern bool m_compress = false;
 class MemoryDump
 {
 public:
@@ -29,7 +28,6 @@ public:
 
 	void setDumpType(enum DumpType dumpType);
 	void flushBuffer();
-	bool m_compress = false;
 
 private:
 	FILE *m_dumpFile;

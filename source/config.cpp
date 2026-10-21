@@ -10,8 +10,12 @@ void Config::readConfig() {
     snprintf(configData.edizon_dir, sizeof configData.edizon_dir, EDIZON_DIR);
     if (access(CONFIG_PATH, F_OK) == 0) {
         FILE *configFile = fopen(CONFIG_PATH, "r+");
-        fread(&configData, 1, sizeof(config_data_t), configFile);
-        fclose(configFile);
+        // access() only proves the path exists; the open can still fail
+        // (permissions, FS error). Reading through a NULL FILE* is UB.
+        if (configFile != NULL) {
+            fread(&configData, 1, sizeof(config_data_t), configFile);
+            fclose(configFile);
+        }
 
         if (strcmp(configData.magic, "EDZOCFG") != 0) {
         configData = {};
@@ -22,7 +26,11 @@ void Config::readConfig() {
 }
 
 void Config::writeConfig() {
-    FILE *configFile = fopen(CONFIG_PATH, "wr");
+    // "wr" is not a valid C mode string (newlib happened to treat it as "w");
+    // use the standard truncate-write mode.
+    FILE *configFile = fopen(CONFIG_PATH, "w");
+    if (configFile == NULL)
+        return;
 
     memcpy(configData.magic, "EDZOCFG", 8);
     fwrite(&configData, 1, sizeof(config_data_t), configFile);

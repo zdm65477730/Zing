@@ -15,7 +15,8 @@
     "NoDmntMainMenuListItemText": "Dmnt沒有附加",
     "UpdateCursorNoCheatsMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\n\n\n",
     "UpdateCursorOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090 瀏覽\n\uE0A4 \uE0A5 修改  \uE0A0 編輯  \uE0A1 退出  \uE0A6+\uE0A4/\uE0A5 字體大小  \uE0B4 刪除\n\uE0A6+\uE04E 切換顯示所有項  \uE0A3 查找下一個啟用項\n",
-    "UpdateCursorNotOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090\uE0A4\uE0A5 瀏覽\n\uE0A0 切換  \uE0B3 添加書簽  \uE0B4 刪除書簽  \uE0A1 退出\n\n",
+    "UpdateCursorNotOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090\uE0A4\uE0A5 瀏覽\n\uE0A0 切換  \uE0B3 添加書簽  \uE0B4 刪除（不可逆）  \uE0A1 退出  \uE0A6+\uE0A4/\uE0A5 字體大小\n\uE0A6+\uE04E 切換顯示所有項  \uE0A3 查找下一個啟用項\n",
+    "UpdateEditValueHeaderMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\n\n\n",
     "UpdateBookmarkPressKeyForComboCountMainMenuCustomDrawerText": "組合按鍵計數 = %d\n",
     "UpdateEditCheatValueMainMenuCustomDrawerText": "\uE092\uE093\uE0A4\uE0A5 \uE0A0 選擇  \uE0A1 退格  \uE045 回車  \uE0A2 取消\n",
     "UpdateShowOutlineCursorMainMenuCustomDrawerText": "金手指大綱 \uE092\uE093 \uE0A0 選擇\n"

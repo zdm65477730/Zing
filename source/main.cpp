@@ -5,6 +5,7 @@
 #include "dmntcht.h"
 #include "memory_dump.hpp"
 #include "utils.hpp"
+#include <ctime>
 
 using namespace tsl;
 
@@ -15,6 +16,11 @@ char Variables[672];
 struct toggle_list_t {
     u32 keycode;
     u32 cheat_id;
+    // Stable identifier: dmnt reassigns cheat_id whenever a cheat is removed
+    // and re-added (e.g. after editing key combos, after reload, etc.). Keep
+    // the readable_name alongside the cached id so we can resolve the live
+    // cheat_id at use time and avoid toggling the wrong entry.
+    char name[0x40];
 };
 std::vector<toggle_list_t> m_toggle_list;
 bool refresh_cheats = true;
@@ -42,10 +48,21 @@ typedef struct {
     bool always_expanded = false;
     bool expanded = false;
     uint32_t index = 0, size = 0;
+    // Group title shown on a collapsed section header row (extracted from a
+    // --SectionStart:<title>-- marker; empty for opcode-style markers, which
+    // fall back to the cheat's readable_name at render time).
+    std::string title;
 } cheat_outline_entry_t;
 std::vector<cheat_outline_entry_t> m_cheat_outline;
 bool m_outline_mode = true;
 bool m_outline_refresh = true;
+// Authoritative record of which section groups the user has expanded, keyed by
+// the begin-marker index into m_cheats[]. Kept separate from m_cheat_outline so
+// that toggling a cheat (which refreshes but does not rebuild the outline) or a
+// delete-driven rebuild can always reconstruct a group's children consistently:
+// a collapsed group (absent from here) never renders its children, even when one
+// of them is enabled.
+std::vector<u32> m_expanded_groups;
 bool show_outline_off = false;
 #define NUM_bookmark 10
 #define MAX_NUM_cheats 35
@@ -53,6 +70,16 @@ u32 m_NUM_cheats = 20;
 #define NUM_cheats m_NUM_cheats
 #define NUM_combokey 3
 u32 total_opcode = 0;
+// Flat (non-outline) view: screen row -> raw m_cheats index, rebuilt once per
+// getcheats() pass by skipping section markers (and disabled cheats in the
+// enabled-only view) with a LOCAL cursor. m_cheatlist_offset is never mutated
+// for skipping, or the every-frame pass would drift it past the end and blank
+// the list. The renderer, info line and every non-outline action resolve the
+// highlighted cheat through this map (see FlatSelectedRaw).
+u32 m_flat_row_raw[MAX_NUM_cheats];
+u32 m_flat_row_count = 0;
+u32 m_real_cheat_count = 0;   // marker-free total, shown by the flat info line
+u32 m_last_real_raw = 0;      // raw index of the last selectable cheat in the current view (bounds the cursor)
 #define MaxCheatCount 0x80
 #define MaxOpcodes 0x100
 #define MaximumProgramOpcodeCount 0x400
@@ -61,10 +88,16 @@ bool m_editCheat = false;
 u8 keycount;
 Result rc;
 std::string m_titleName = "", m_titleName2 = "", m_versionString = "";
+// Upper bound for cheat / toggle text files read into memory. Guards against a
+// failed ftell() (-1 wrapping to SIZE_MAX) or a corrupt/huge file making the
+// allocation below throw bad_alloc, which would std::terminate the overlay
+// (exceptions are enabled but never caught on these parse paths).
+static constexpr size_t CHEAT_FILE_MAX_LEN = 4u * 1024u * 1024u; // 4 MiB
+
 char m_cheatcode_path[128];
 char m_toggle_path[128];
 u64 m_cheatCnt = 0; 
-DmntCheatEntry *m_cheats = nullptr;
+std::unique_ptr<DmntCheatEntry[]> m_cheats;
 struct outline_t {
     std::string label;
     u32 index;
@@ -88,6 +121,14 @@ u32 m_outline_index = 0;
 bool m_show_outline = false;
 std::vector<outline_t> m_outline;
 bool save_code_to_file = false;
+// Set whenever the user flips a cheat's enabled state (A-button checkbox or a
+// key-combo toggle). getcheats() flushes the current dmnt state to toggles.brz
+// as soon as it has re-read m_cheats, so the persisted enable/disable always
+// matches the latest user intent. Without this, toggles.brz is only rewritten
+// on the edit-exit path (save_code_to_file), so a plain check-then-uncheck left
+// a stale 'true' behind that loadtoggles() would re-apply on the next reload
+// from the .txt, resurrecting a cheat the user had just unchecked.
+bool save_toggles_to_file = false;
 bool m_edit_value = false;
 bool m_hex_mode = false;
 bool m_get_toggle_keycode = false;
@@ -167,12 +208,24 @@ u32 m_index = 0;
 u32 m_cheat_index = 0, m_cheat_index_save = 0;
 std::string m_edizon_dir = "/switch/EdiZon";
 std::string m_store_extension = "A";
-Debugger *m_debugger;
-MemoryDump *m_AttributeDumpBookmark = nullptr;
+std::unique_ptr<Debugger> m_debugger;
+std::unique_ptr<MemoryDump> m_AttributeDumpBookmark;
 u8 m_addresslist_offset = 0;
 u32 m_cheatlist_offset = 0, m_cheatlist_offset_save = 0;
 bool m_32bitmode = false;
 static const std::vector<u8> dataTypeSizes = {1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 8};
+
+// dataTypeSizes covers the 11 concrete types (index 0..SEARCH_TYPE_POINTER).
+// bookmark.type / m_selected_type can hold an arbitrary value when read back
+// from a corrupt or legacy .dat; raw-indexing with it would read past the
+// vector and hand a garbage width to read/writeMemory, which then overruns the
+// 8-byte searchValue_t. Return 0 for anything out of range so the access is
+// skipped instead of corrupting memory.
+static inline size_t DataTypeSize(searchType_t type) {
+    return (static_cast<size_t>(type) < dataTypeSizes.size())
+               ? dataTypeSizes[static_cast<size_t>(type)]
+               : 0;
+}
 searchValue_t m_oldvalue[NUM_bookmark] = {0};
 DmntCheatProcessMetadata metadata;
 char bookmarkfilename[200] = "bookmark filename";
@@ -209,7 +262,7 @@ bool init_se_tools() {
     dmnt_present = isServiceRunning("dmnt:cht");
     if (!dmnt_present) return false;
 
-    m_debugger = new Debugger();
+    m_debugger = std::make_unique<Debugger>();
     uint64_t PID = 0;
     int64_t timeout = 1000'000'000;
     int64_t interval = 10'000'000;
@@ -237,6 +290,11 @@ bool init_se_tools() {
             m_versionString = std::string(m_appControlData.nacp.display_version);
         }
     } else {
+        // No live cheat process: leave the overlay in a clean "not attached"
+        // state. m_debugger was allocated above but is unusable here, so free
+        // it; cleanup_se_tools() also resets it, which is a safe no-op once
+        // the unique_ptr is already null.
+        m_debugger.reset();
         return false;
     }
 
@@ -245,21 +303,83 @@ bool init_se_tools() {
     snprintf(bookmarkfilename, 200, "%s/%02x%02x%02x%02x%02x%02x%02x%02x.dat", EDIZON_DIR,
              build_id[0], build_id[1], build_id[2], build_id[3], build_id[4], build_id[5], build_id[6], build_id[7]);
 
-    m_AttributeDumpBookmark = new MemoryDump(bookmarkfilename, DumpType::ADDR, false);
+    m_AttributeDumpBookmark = std::make_unique<MemoryDump>(bookmarkfilename, DumpType::ADDR, false);
 
     return true;
 }
 
 void cleanup_se_tools() {
-    if (m_debugger) {
-        delete m_debugger;
-        m_debugger = nullptr;
+    m_debugger.reset();
+    m_AttributeDumpBookmark.reset();
+}
+
+// Read one pointer-chain step from the cheat process. The old code did
+//   readMemory(&nextaddress, m_32bitmode ? 4 : 8, nextaddress)
+// which on aarch64 LP64 only overwrites the low 32 bits of the u64
+// `nextaddress` and leaves the upper 32 bits holding the *previous* step's
+// value, producing a wrong 64-bit pointer. Going through a typed local
+// guarantees the high bits are zeroed in 32-bit mode.
+static inline u64 ReadPointerStep(Debugger *dbg, u64 addr) {
+    if (dbg == nullptr) return 0;
+    if (m_32bitmode) {
+        u32 v32 = 0;
+        dbg->readMemory(&v32, sizeof(v32), addr);
+        return (u64)v32;
+    }
+    u64 v64 = 0;
+    dbg->readMemory(&v64, sizeof(v64), addr);
+    return v64;
+}
+
+// Keep at most MAX_BACKUPS rolling copies of the cheat .txt before it is
+// truncated and rewritten by dumpcodetofile(). Named <path>.bak.1 (newest) ..
+// <path>.bak.N (oldest); each call shifts them down and writes a fresh .1,
+// dropping the oldest. This bounds the SD-card clutter (the previous
+// ".bak.<YYYYmmdd-HHMMSS>" scheme grew without limit and, with no RTC, two saves
+// in the same second silently overwrote each other). A backup whose content is
+// byte-identical to the current newest one is skipped, so saves that did not
+// actually change the library produce no churn.
+static void backup_cheat_library_rolling(const char *srcpath) {
+    constexpr int MAX_BACKUPS = 5;
+    char patha[260], pathb[260];
+
+    FILE *cur = fopen(srcpath, "rb");
+    if (cur == NULL) return;                       // no library on disk yet
+
+    snprintf(patha, sizeof patha, "%s.bak.1", srcpath);
+    FILE *prev = fopen(patha, "rb");
+    if (prev != NULL) {
+        bool identical = false;
+        fseek(cur, 0, SEEK_END); long cs = ftell(cur);
+        fseek(prev, 0, SEEK_END); long ps = ftell(prev);
+        if (cs >= 0 && cs == ps) {
+            identical = true;
+            rewind(cur); rewind(prev);
+            int ca, pa;
+            do { ca = fgetc(cur); pa = fgetc(prev); if (ca != pa) { identical = false; break; } } while (ca != EOF);
+        }
+        fclose(prev);
+        if (identical) { fclose(cur); return; }    // library unchanged
     }
 
-    if (m_AttributeDumpBookmark) {
-        delete m_AttributeDumpBookmark;
-        m_AttributeDumpBookmark = nullptr;
+    // Shift .bak.(N-1)->.bak.N ... .bak.1->.bak.2; oldest is dropped.
+    for (int k = MAX_BACKUPS - 1; k >= 1; k--) {
+        snprintf(patha, sizeof patha, "%s.bak.%d", srcpath, k);
+        snprintf(pathb, sizeof pathb, "%s.bak.%d", srcpath, k + 1);
+        rename(patha, pathb);                       // missing source: harmless fail
     }
+
+    snprintf(patha, sizeof patha, "%s.bak.1", srcpath);
+    FILE *dst = fopen(patha, "wb");
+    if (dst != NULL) {
+        char buf[4096]; size_t n;
+        rewind(cur);
+        while ((n = fread(buf, 1, sizeof buf, cur)) > 0) {
+            if (fwrite(buf, 1, n, dst) != n) break;
+        }
+        fclose(dst);
+    }
+    fclose(cur);
 }
 
 void dumpcodetofile() {
@@ -269,6 +389,10 @@ void dumpcodetofile() {
         return;
     snprintf(m_cheatcode_path, 128, "sdmc:/atmosphere/contents/%016lX/cheats/%02X%02X%02X%02X%02X%02X%02X%02X.txt", metadata.title_id, build_id[0], build_id[1], build_id[2], build_id[3], build_id[4], build_id[5], build_id[6], build_id[7]);
     snprintf(m_toggle_path, 128, "sdmc:/atmosphere/contents/%016lX/cheats/toggles.txt", metadata.title_id);
+    // Last-resort safety net before the .txt library is truncated and rewritten:
+    // roll a bounded set of backups (see backup_cheat_library_rolling). Deleting a
+    // cheat here is otherwise unrecoverable, so keep a restore point.
+    backup_cheat_library_rolling(m_cheatcode_path);
     pfile = fopen(m_cheatcode_path, "w");
     if (pfile != NULL) {
         snprintf(tmp, 1000, "[Zing %s %s %s TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X]\n\n", VERSION, m_titleName.c_str(), m_versionString.c_str(), metadata.title_id,
@@ -285,10 +409,12 @@ void dumpcodetofile() {
                 if (strlen(tmp) > 0) fputs(tmp, pfile);
             }
 
-            if ((i == 0) && (m_cheats[0].cheat_id == 0))
-                snprintf(tmp, 1000, "{%s}\n", m_cheats[i].definition.readable_name);
-            else
-                snprintf(tmp, 1000, "[%s]\n", m_cheats[i].definition.readable_name);
+            // NOTE: master code is registered separately via dmntchtSetMasterCheat and
+            // never appears in m_cheats (dmntchtGetCheats only returns regular cheats).
+            // Always dump as a regular [name] block; previously the first entry was
+            // wrongly emitted as {name} which turned it into a master code on reload
+            // and made it impossible to disable from the UI.
+            snprintf(tmp, 1000, "[%s]\n", m_cheats[i].definition.readable_name);
             fputs(tmp, pfile);
             for (u32 j = 0; j < m_cheats[i].definition.num_opcodes; j++) {
                 u16 opcode = (m_cheats[i].definition.opcodes[j] >> 28) & 0xF;
@@ -318,12 +444,14 @@ void dumpcodetofile() {
                     case 1:
                         snprintf(tmp, sizeof(tmp), "%08X ", m_cheats[i].definition.opcodes[j++]);
                         fputs(tmp, pfile);
-                        // 3+1
+                        // 3+1: intentionally cascades to emit the operand words
+                        [[fallthrough]];
                     case 9:
                     case 0xC04:
                         // 2+1
                         snprintf(tmp, sizeof(tmp), "%08X ", m_cheats[i].definition.opcodes[j++]);
                         fputs(tmp, pfile);
+                        [[fallthrough]]; // cascade into the 1+1 group
                     case 3:
                     case 10:
                         // 1+1
@@ -340,6 +468,7 @@ void dumpcodetofile() {
                         // 3
                         snprintf(tmp, sizeof(tmp), "%08X ", m_cheats[i].definition.opcodes[j++]);
                         fputs(tmp, pfile);
+                        [[fallthrough]]; // 4/6 share their tail with 5/7/...
                     case 5:
                     case 7:
                     case 0xC00:
@@ -347,6 +476,7 @@ void dumpcodetofile() {
                         snprintf(tmp, sizeof(tmp), "%08X ", m_cheats[i].definition.opcodes[j++]);
                         fputs(tmp, pfile);
                         // 2
+                        [[fallthrough]]; // cascade into the single-word group
                     case 2:
                     case 8:
                     case 0xC1:
@@ -381,56 +511,104 @@ void dumpcodetofile() {
     }
 }
 
+// Self-describing header written at the start of the .bz1 data region.
+// Previously the loader guessed the record layout purely from the file size,
+// which is ambiguous (9 legacy 8-byte records == 1 modern 72-byte record).
+// A magic + explicit stride removes all guesswork going forward, while the
+// legacy size-heuristic path is kept for files written before this header.
+struct bz_header_t {
+    u32 magic;   // BZ_TOGGLE_MAGIC
+    u32 stride;  // sizeof(toggle_list_t) at save time
+    u32 count;   // number of records that follow
+};
+static constexpr u32 BZ_TOGGLE_MAGIC = 0x5A54312D; // "ZT1-"
+
 void save_breeze_toggle() {
     std::string breeze_toggle_filename = bookmarkfilename;
     breeze_toggle_filename.replace((breeze_toggle_filename.length()-3), 3, "bz1");
-    MemoryDump *breeze_toggle_file;
-    breeze_toggle_file = new MemoryDump(breeze_toggle_filename.c_str(), DumpType::ADDR, true);
-    for (auto entry : m_toggle_list) {
+    std::unique_ptr<MemoryDump> breeze_toggle_file =
+        std::make_unique<MemoryDump>(breeze_toggle_filename.c_str(), DumpType::ADDR, true);
+    bz_header_t hdr = {};
+    hdr.magic = BZ_TOGGLE_MAGIC;
+    hdr.stride = (u32)sizeof(toggle_list_t);
+    hdr.count = (u32)m_toggle_list.size();
+    breeze_toggle_file->addData((u8 *)&hdr, sizeof(hdr));
+    for (const auto &entry : m_toggle_list) {
         breeze_toggle_file->addData((u8 *)&entry, sizeof(toggle_list_t));
     }
-    delete breeze_toggle_file;
 }
 
 void load_breeze_toggle() {
     m_toggle_list.clear();
     std::string breeze_toggle_filename = bookmarkfilename;
     breeze_toggle_filename.replace((breeze_toggle_filename.length()-3), 3, "bz1");
-    MemoryDump *breeze_toggle_file;
-    toggle_list_t entry;
-    breeze_toggle_file = new MemoryDump(breeze_toggle_filename.c_str(), DumpType::ADDR, false);
-    if (breeze_toggle_file->size() > 0)
-        for (size_t i = 0; i < breeze_toggle_file->size() / sizeof(toggle_list_t); i++) {
-            breeze_toggle_file->getData(i * sizeof(toggle_list_t), &entry, sizeof(toggle_list_t));
+    std::unique_ptr<MemoryDump> breeze_toggle_file =
+        std::make_unique<MemoryDump>(breeze_toggle_filename.c_str(), DumpType::ADDR, false);
+    size_t file_size = breeze_toggle_file->size();
+    if (file_size == 0)
+        return;
+
+    constexpr size_t NEW_STRIDE = sizeof(toggle_list_t);
+    // Layout of the pre-name struct (keycode + cheat_id only).
+    constexpr size_t OLD_STRIDE = sizeof(u32) * 2;
+
+    // Try to read the self-describing header first. New saves always write it,
+    // so a matching magic means the records follow at the declared stride. A
+    // count of 0 is valid (empty toggle list) and must NOT fall through to the
+    // legacy reader, which would misinterpret the 12-byte header as a record.
+    bz_header_t hdr = {};
+    breeze_toggle_file->getData(0, &hdr, sizeof(hdr));
+    if (hdr.magic == BZ_TOGGLE_MAGIC && hdr.stride >= OLD_STRIDE &&
+        (sizeof(hdr) + (size_t)hdr.count * hdr.stride) <= file_size) {
+        for (u32 i = 0; i < hdr.count; i++) {
+            toggle_list_t entry = {};
+            // Read only the smaller of stored/struct stride; missing trailing
+            // bytes (e.g. name for a future larger stride) stay zero-init.
+            size_t rec = std::min<size_t>(hdr.stride, NEW_STRIDE);
+            breeze_toggle_file->getData(sizeof(hdr) + (size_t)i * hdr.stride, &entry, rec);
+            entry.name[sizeof(entry.name) - 1] = 0;
             m_toggle_list.push_back(entry);
         }
-    delete breeze_toggle_file;
+        return;
+    }
+
+    // ---- Legacy path ----
+    // A headerless file was necessarily written before the self-describing
+    // header existed, i.e. before toggle_list_t gained the name field, so EVERY
+    // record uses the old 8-byte (keycode + cheat_id) layout. (The previous
+    // size-heuristic here misread headerless files whose byte length happened to
+    // be a multiple of the new 72-byte stride, e.g. 9/18/27 stored toggles.)
+    // ReconcileToggleList() back-fills the name from the cheat_id once m_cheats
+    // is populated.
+    for (size_t off = 0; off + OLD_STRIDE <= file_size; off += OLD_STRIDE) {
+        toggle_list_t entry = {};   // zero-init leaves name empty
+        breeze_toggle_file->getData(off, &entry, OLD_STRIDE);
+        m_toggle_list.push_back(entry);
+    }
 }
 
 void save_breeze_action() {
     std::string breeze_action_filename = bookmarkfilename;
     breeze_action_filename.replace((breeze_action_filename.length()-3), 3, "bz2");
-    MemoryDump *breeze_acton_file;
-    breeze_acton_file = new MemoryDump(breeze_action_filename.c_str(), DumpType::ADDR, true);
-    for (auto entry : m_breeze_action_list) {
+    std::unique_ptr<MemoryDump> breeze_acton_file =
+        std::make_unique<MemoryDump>(breeze_action_filename.c_str(), DumpType::ADDR, true);
+    for (const auto &entry : m_breeze_action_list) {
         breeze_acton_file->addData((u8 *)&entry, sizeof(breeze_action_list_t));
     }
-    delete breeze_acton_file;
 }
 
 void load_breeze_action() {
     m_breeze_action_list.clear();
     std::string breeze_action_filename = bookmarkfilename;
     breeze_action_filename.replace((breeze_action_filename.length()-3), 3, "bz2");
-    MemoryDump *breeze_acton_file;
+    std::unique_ptr<MemoryDump> breeze_acton_file =
+        std::make_unique<MemoryDump>(breeze_action_filename.c_str(), DumpType::ADDR, false);
     breeze_action_list_t entry;
-    breeze_acton_file = new MemoryDump(breeze_action_filename.c_str(), DumpType::ADDR, false);
     if (breeze_acton_file->size() > 0)
         for (size_t i = 0; i < breeze_acton_file->size() / sizeof(breeze_action_list_t); i++) {
             breeze_acton_file->getData(i * sizeof(breeze_action_list_t), &entry, sizeof(breeze_action_list_t));
             m_breeze_action_list.push_back(entry);
         }
-    delete breeze_acton_file;
 }
 
 bool loadcachefromfile() {
@@ -454,15 +632,22 @@ bool loadcachefromfile() {
     }
     if (pfile != NULL) {
         fseek(pfile, 0, SEEK_END);
-        size_t len = ftell(pfile);
-        u8 *s = new u8[len];
+        long fileLen = ftell(pfile);
+        if (fileLen < 0 || static_cast<size_t>(fileLen) > CHEAT_FILE_MAX_LEN) {
+            fclose(pfile);
+            return false;
+        }
+        size_t len = static_cast<size_t>(fileLen);
+        // Owned buffer: every parse error below returns early, so the raw
+        // `new u8[len]` leaked the whole file on all those paths.
+        std::unique_ptr<u8[]> s(new u8[len]);
         fseek(pfile, 0, SEEK_SET);
-        fread(s, 1, len, pfile);
+        fread(s.get(), 1, len, pfile);
         fclose(pfile); 
         if (copy_cheat_file) {
             pfile2 = fopen(m_cheatcode_path, "wb");
             if (pfile2 != NULL) {
-                fwrite(s, 1, len, pfile2);
+                fwrite(s.get(), 1, len, pfile2);
                 fclose(pfile2);
             }
         }
@@ -500,6 +685,7 @@ bool loadcachefromfile() {
                 cheatentry.enabled = false;
                 /* Extract name bounds. */
                 size_t j = i + 1;
+                if (j >= len) return false;
                 while (s[j] != ']') {
                     j++;
                     if (j >= len) {
@@ -507,10 +693,13 @@ bool loadcachefromfile() {
                     }
                 }
                 /* s[i+1:j] is cheat name. */
-                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name));
+                // Reserve the final byte for the NUL terminator: the old
+                // bound used sizeof(readable_name), so the worst-case
+                // readable_name[cheat_name_len] = 0 wrote one past the array.
+                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name) - 1);
                 std::memcpy(cheatentry.definition.readable_name, &s[i + 1], cheat_name_len);
-                for (u32 i = 0; i < cheat_name_len; i++) {
-                    if (cheatentry.definition.readable_name[i] == 13 || cheatentry.definition.readable_name[i] == 10) cheatentry.definition.readable_name[i] = 32;
+                for (u32 cc = 0; cc < cheat_name_len; cc++) {
+                    if (cheatentry.definition.readable_name[cc] == 13 || cheatentry.definition.readable_name[cc] == 10) cheatentry.definition.readable_name[cc] = 32;
                 };
                 cheatentry.definition.readable_name[cheat_name_len] = 0;
                 label_len = cheat_name_len;
@@ -519,6 +708,7 @@ bool loadcachefromfile() {
                 i = j + 1;
             } else if (s[i] == '(') {
                 size_t j = i + 1;
+                if (j >= len) return false;
                 while (s[j] != ')') {
                     j++;
                     if (j >= len) {
@@ -537,6 +727,7 @@ bool loadcachefromfile() {
                 cheatentry.enabled = true;
                 /* Extract name bounds */
                 size_t j = i + 1;
+                if (j >= len) return false;
                 while (s[j] != '}') {
                     j++;
                     if (j >= len) {
@@ -545,7 +736,10 @@ bool loadcachefromfile() {
                 }
 
                 /* s[i+1:j] is cheat name. */
-                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name));
+                // Reserve the final byte for the NUL terminator (same bound as
+                // the '[' branch above); the old sizeof() let the worst-case
+                // readable_name[cheat_name_len] = 0 write one past the array.
+                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name) - 1);
                 memcpy(cheatentry.definition.readable_name, &s[i + 1], cheat_name_len);
                 cheatentry.definition.readable_name[cheat_name_len] = 0;
                 label_len = cheat_name_len;
@@ -605,8 +799,16 @@ bool loadcachefromfile() {
     } else {
         cache_outline_t entry = {};
         DmntCheatEntry centry = {};
-        strcat(m_cheatcode_path, "LoadFailedLoadCacheFromFileDmntCheatEntryText"_tr.c_str());
-        strcpy((centry.definition.readable_name), m_cheatcode_path);
+        // Bound the error message to the destination field: the old
+        // strcat(m_cheatcode_path[128], ...) followed by
+        // strcpy(readable_name[0x40], path) could overflow both buffers when the
+        // localized suffix pushed the path past the field size.
+        std::string failMsg = std::string(m_cheatcode_path) + "LoadFailedLoadCacheFromFileDmntCheatEntryText"_tr;
+        size_t n = failMsg.size();
+        if (n > sizeof(centry.definition.readable_name) - 1)
+            n = sizeof(centry.definition.readable_name) - 1;
+        std::memcpy(centry.definition.readable_name, failMsg.data(), n);
+        centry.definition.readable_name[n] = 0;
         m_cache.push_back(centry);
         m_cache_outline.push_back(entry);
     }
@@ -618,8 +820,8 @@ bool loadcheatsfromfile() {
         return false;
 
     m_outline.clear();
-    u8 _index = 0;
-    u8 last_entry = 0xFF;
+    u32 _index = 0;
+    u32 last_entry = 0xFFFFFFFFu;
 
     snprintf(m_cheatcode_path, 128, "sdmc:/atmosphere/contents/%016lX/cheats/%02X%02X%02X%02X%02X%02X%02X%02X.txt", metadata.title_id, build_id[0], build_id[1], build_id[2], build_id[3], build_id[4], build_id[5], build_id[6], build_id[7]);
     
@@ -632,10 +834,17 @@ bool loadcheatsfromfile() {
     }
     if (pfile != NULL) {
         fseek(pfile, 0, SEEK_END);
-        size_t len = ftell(pfile);
-        u8 *s = new u8[len];
+        long fileLen = ftell(pfile);
+        if (fileLen < 0 || static_cast<size_t>(fileLen) > CHEAT_FILE_MAX_LEN) {
+            fclose(pfile);
+            return false;
+        }
+        size_t len = static_cast<size_t>(fileLen);
+        // Owned buffer: every parse error below returns early, so the raw
+        // `new u8[len]` leaked the whole file on all those paths.
+        std::unique_ptr<u8[]> s(new u8[len]);
         fseek(pfile, 0, SEEK_SET);
-        fread(s, 1, len, pfile);
+        fread(s.get(), 1, len, pfile);
         fclose(pfile);
         DmntCheatEntry cheatentry;
         cheatentry.definition.num_opcodes = 0;
@@ -668,6 +877,7 @@ bool loadcheatsfromfile() {
                 cheatentry.enabled = false;
                 /* Extract name bounds. */
                 size_t j = i + 1;
+                if (j >= len) return false;
                 while (s[j] != ']') {
                     j++;
                     if (j >= len) {
@@ -675,10 +885,13 @@ bool loadcheatsfromfile() {
                     }
                 }
                 /* s[i+1:j] is cheat name. */
-                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name));
+                // Reserve the final byte for the NUL terminator: the old
+                // bound used sizeof(readable_name), so the worst-case
+                // readable_name[cheat_name_len] = 0 wrote one past the array.
+                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name) - 1);
                 std::memcpy(cheatentry.definition.readable_name, &s[i + 1], cheat_name_len);
-                for (u32 i = 0; i < cheat_name_len; i++) {
-                    if (cheatentry.definition.readable_name[i] == 13 || cheatentry.definition.readable_name[i] == 10) cheatentry.definition.readable_name[i] = 32;
+                for (u32 cc = 0; cc < cheat_name_len; cc++) {
+                    if (cheatentry.definition.readable_name[cc] == 13 || cheatentry.definition.readable_name[cc] == 10) cheatentry.definition.readable_name[cc] = 32;
                 };
                 cheatentry.definition.readable_name[cheat_name_len] = 0;
                 label_len = cheat_name_len;
@@ -687,6 +900,7 @@ bool loadcheatsfromfile() {
                 i = j + 1;
             } else if (s[i] == '(') {
                 size_t j = i + 1;
+                if (j >= len) return false;
                 while (s[j] != ')') {
                     j++;
                     if (j >= len) {
@@ -703,6 +917,7 @@ bool loadcheatsfromfile() {
                 cheatentry.enabled = true;
                 /* Extract name bounds */
                 size_t j = i + 1;
+                if (j >= len) return false;
                 while (s[j] != '}') {
                     j++;
                     if (j >= len) {
@@ -711,7 +926,10 @@ bool loadcheatsfromfile() {
                 }
 
                 /* s[i+1:j] is cheat name. */
-                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name));
+                // Reserve the final byte for the NUL terminator (same bound as
+                // the '[' branch above); the old sizeof() let the worst-case
+                // readable_name[cheat_name_len] = 0 write one past the array.
+                const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name) - 1);
                 memcpy(cheatentry.definition.readable_name, &s[i + 1], cheat_name_len);
                 cheatentry.definition.readable_name[cheat_name_len] = 0;
                 label_len = cheat_name_len;
@@ -774,7 +992,62 @@ DmntCheatEntry *GetCheatEntryByReadableName(const char *readable_name) {
     return nullptr;
 }
 
+// Resolve the live dmnt cheat_id for a cheat identified by its readable name.
+// Returns true and writes the id to *out_id on a match; returns false when no
+// current cheat carries the name. dmnt does not forbid duplicate readable_name,
+// so when *ambiguous (if provided) is set true the name matches more than one
+// cheat and the caller must NOT trust the single id -- it should fall back to the
+// per-entry stored cheat_id, otherwise every same-named toggle would collapse onto
+// the first match and the others could never be switched off.
+static bool LookupCheatIdByName(const char *name, u32 *out_id, bool *ambiguous = nullptr) {
+    if (name == nullptr || name[0] == 0 || out_id == nullptr) return false;
+    u32 matches = 0;
+    u32 first_id = 0;
+    for (u32 i = 0; i < m_cheatCnt; i++) {
+        if (m_cheats == nullptr) break;
+        if (std::strncmp(m_cheats[i].definition.readable_name, name,
+                         sizeof(m_cheats[i].definition.readable_name)) == 0) {
+            if (matches == 0) first_id = m_cheats[i].cheat_id;
+            matches++;
+        }
+    }
+    if (ambiguous != nullptr) *ambiguous = (matches > 1);
+    if (matches == 0) return false;
+    *out_id = first_id;
+    return true;
+}
+
+// Reconcile the cached cheat_id values in m_toggle_list against the live dmnt
+// cheat list. Older .bz1 files were written before name was a persisted field,
+// so for legacy entries we back-fill the name from the cheat_id when it still
+// matches. For modern entries we always refresh cheat_id by name lookup.
+static void ReconcileToggleList() {
+    if (m_cheats == nullptr) return;
+    for (auto &e : m_toggle_list) {
+        // Legacy entry without persisted name: try to recover it from cheat_id.
+        if (e.name[0] == 0) {
+            for (u32 i = 0; i < m_cheatCnt; i++) {
+                if (m_cheats[i].cheat_id == e.cheat_id) {
+                    std::memcpy(e.name, m_cheats[i].definition.readable_name, sizeof(e.name));
+                    e.name[sizeof(e.name) - 1] = 0;
+                    break;
+                }
+            }
+        }
+        // Re-resolve cheat_id by name so subsequent toggles hit the right entry.
+        // Skip the overwrite when the name is shared by several cheats: collapsing
+        // them onto the first match would make the duplicates un-toggleable, so we
+        // keep the stored cheat_id (correct per-entry for freshly assigned combos).
+        u32 live_id = 0;
+        bool ambiguous = false;
+        if (LookupCheatIdByName(e.name, &live_id, &ambiguous)) {
+            if (!ambiguous) e.cheat_id = live_id;
+        }
+    }
+}
+
 bool ParseCheatToggles(const char *s, size_t len) {
+    if (s == nullptr || len == 0) return false;
     size_t i = 0;
     char cur_cheat_name[sizeof(DmntCheatDefinition::readable_name)];
     char toggle[8];
@@ -785,6 +1058,9 @@ bool ParseCheatToggles(const char *s, size_t len) {
         } else if (s[i] == '[') {
             /* Extract name bounds. */
             size_t j = i + 1;
+            /* Bounds check before the first read to avoid OOB when input
+             * ends with '['. */
+            if (j >= len) return false;
             while (s[j] != ']') {
                 j++;
                 if (j >= len) {
@@ -792,27 +1068,39 @@ bool ParseCheatToggles(const char *s, size_t len) {
                 }
             }
             /* s[i+1:j] is cheat name. */
-            const size_t cheat_name_len = std::min(j - i - 1, sizeof(cur_cheat_name));
+            const size_t cheat_name_len = std::min(j - i - 1, sizeof(cur_cheat_name) - 1);
             std::memcpy(cur_cheat_name, &s[i + 1], cheat_name_len);
             cur_cheat_name[cheat_name_len] = 0;
             /* Skip onwards. */
             i = j + 1;
+            if (i >= len) return false;
             /* Skip whitespace. */
-            while (std::isspace(static_cast<unsigned char>(s[i]))) {
+            while (i < len && std::isspace(static_cast<unsigned char>(s[i]))) {
                 i++;
             }
+            if (i >= len) return false;
             /* Parse whether to toggle. */
             j = i + 1;
-            while (!std::isspace(static_cast<unsigned char>(s[j]))) {
-                j++;
-                if (j >= len || (j - i) >= sizeof(toggle)) {
-                    return false;
+            /* Bounds check before the first read so a one-char toggle at
+             * end-of-buffer (e.g. "1") does not read s[len]. */
+            if (j >= len) {
+                /* Toggle value is exactly one character at end of file. */
+                const size_t toggle_len = 1;
+                std::memcpy(toggle, &s[i], toggle_len);
+                toggle[toggle_len] = 0;
+                j = i + 1;
+            } else {
+                while (!std::isspace(static_cast<unsigned char>(s[j]))) {
+                    j++;
+                    if (j >= len || (j - i) >= sizeof(toggle)) {
+                        return false;
+                    }
                 }
+                /* s[i:j] is toggle. */
+                const size_t toggle_len = (j - i);
+                std::memcpy(toggle, &s[i], toggle_len);
+                toggle[toggle_len] = 0;
             }
-            /* s[i:j] is toggle. */
-            const size_t toggle_len = (j - i);
-            std::memcpy(toggle, &s[i], toggle_len);
-            toggle[toggle_len] = 0;
             /* Allow specifying toggle for not present cheat. */
             DmntCheatEntry *entry = GetCheatEntryByReadableName(cur_cheat_name);
             if (entry != nullptr) {
@@ -840,11 +1128,18 @@ void loadtoggles() {
     pfile = fopen(m_toggle_path, "rb");
     if (pfile != NULL) {
         fseek(pfile, 0, SEEK_END);
-        size_t len = ftell(pfile);
-        char *s = new char[len];
-        fseek(pfile, 0, SEEK_SET);
-        fread(s, 1, len, pfile);
-        ParseCheatToggles(s, len);
+        long fileLen = ftell(pfile);
+        // Treat a failed ftell() or an over-long file as "nothing to parse"
+        // rather than allocating based on a garbage length.
+        size_t len = (fileLen < 0 || static_cast<size_t>(fileLen) > CHEAT_FILE_MAX_LEN)
+                         ? 0 : static_cast<size_t>(fileLen);
+        if (len > 0) {
+            char *s = new char[len];
+            fseek(pfile, 0, SEEK_SET);
+            size_t rd = fread(s, 1, len, pfile);
+            ParseCheatToggles(s, rd);
+            delete[] s;
+        }
         fclose(pfile);
     }
 }
@@ -855,7 +1150,10 @@ void savetoggles() {
     char tmp[1000];
     pfile = fopen(m_toggle_path, "w");
     if (pfile != NULL) {
-        for (u8 i = 0; i < m_cheatCnt; i++) {
+        // m_cheatCnt is u64; an u8 loop index would silently truncate past
+        // 255 entries (MaxCheatCount is 0x80 today, but the type mismatch is
+        // a footgun). Use u32 to match dmnt API conventions.
+        for (u32 i = 0; i < (u32)m_cheatCnt; i++) {
             snprintf(tmp, 1000, "[%s]\n%s\n", m_cheats[i].definition.readable_name, (m_cheats[i].enabled) ? "true" : "false");
             fputs(tmp, pfile);
         }
@@ -864,7 +1162,9 @@ void savetoggles() {
 }
 
 static std::string _getAddressDisplayString(u64 address, Debugger *debugger, searchType_t searchType) {
-    char ss[200];
+    // Pre-initialize so the SEARCH_TYPE_NONE fall-through path still returns
+    // a deterministic empty string instead of uninitialized stack bytes.
+    char ss[200] = "";
 
     searchValue_t searchValue;
     searchValue._u64 = debugger->peekMemory(address);
@@ -914,45 +1214,164 @@ static std::string _getAddressDisplayString(u64 address, Debugger *debugger, sea
 bool deletebookmark() {
     std::string old_bookmarkfilename = bookmarkfilename;
     bookmark_t bookmark;
+    // Nothing stored yet -> nothing to delete. Bail before touching files
+    // (the old code would still rewrite an empty dump and a stale `.old`).
+    size_t bookmark_count = m_AttributeDumpBookmark->size() / sizeof(bookmark_t);
+    if (bookmark_count == 0) return false;
+    // The row under the cursor must be a real entry; otherwise the
+    // `i != target` filter below matches nothing and silently keeps every
+    // bookmark while still rewriting the backing files.
+    size_t target = (size_t)m_index + m_addresslist_offset;
+    if (target >= bookmark_count) return false;
     old_bookmarkfilename.replace((old_bookmarkfilename.length()-3),3,"old");
-    MemoryDump *m_old_AttributeDumpBookmark;
-    m_old_AttributeDumpBookmark = new MemoryDump(old_bookmarkfilename.c_str(), DumpType::ADDR, true);
+    std::unique_ptr<MemoryDump> m_old_AttributeDumpBookmark =
+        std::make_unique<MemoryDump>(old_bookmarkfilename.c_str(), DumpType::ADDR, true);
     for (size_t i = 0; i < m_AttributeDumpBookmark->size() / sizeof(bookmark_t); i++) {
         {
             m_AttributeDumpBookmark->getData(i * sizeof(bookmark_t), &bookmark, sizeof(bookmark_t));
             m_old_AttributeDumpBookmark->addData((u8 *)&bookmark, sizeof(bookmark_t));
         }
     }
-    delete m_AttributeDumpBookmark;
-    m_AttributeDumpBookmark = new MemoryDump(bookmarkfilename, DumpType::ADDR, true);
+    // Close the previous bookmark file object BEFORE opening a fresh truncated
+    // one. The previous `m_AttributeDumpBookmark = make_unique<...>` form lets the
+    // right-hand side construct first ("w+b" truncates the file) and only then
+    // runs the old object's destructor, whose flushBuffer/fclose act on the SAME
+    // still-open path afterwards. That overlap could leave the pre-delete (full)
+    // record set on disk, so a bookmark the user removed reappeared after the
+    // overlay process restarted and re-read the .dat. reset() flushes+closed the
+    // old handle first, restoring the deterministic delete-then-create order the
+    // code used before the RAII migration.
+    m_AttributeDumpBookmark.reset();
+    m_AttributeDumpBookmark = std::make_unique<MemoryDump>(bookmarkfilename, DumpType::ADDR, true);
     for (size_t i = 0; i < m_old_AttributeDumpBookmark->size() / sizeof(bookmark_t); i++) {
-        if (i != m_index + m_addresslist_offset) {
+        if (i != target) {
             m_old_AttributeDumpBookmark->getData(i * sizeof(bookmark_t), &bookmark, sizeof(bookmark_t));
             m_AttributeDumpBookmark->addData((u8 *)&bookmark, sizeof(bookmark_t));
         }
     }
-    delete m_old_AttributeDumpBookmark;
+    // Force the reduced set to disk now instead of relying on the render loop's
+    // size()/the destructor to flush it, so the deletion survives even an abrupt
+    // overlay-process teardown.
+    m_AttributeDumpBookmark->size();
     return true;
+}
+
+// Capacity-safe append. The old code called strncat(dst, src, sizeof dst - 1),
+// but strncat's third argument is the maximum number of bytes to append *after
+// dst's existing contents*, so with a non-empty dst it happily writes past the
+// end of the buffer. That is what corrupted the shared display columns
+// (BookmarkLabels / Cursor / MultiplierStr ...) once bookmarks grew the column
+// and the whole cheat list was then appended. Always bound by remaining space.
+static void SafeCat(char *dst, size_t cap, const char *src) {
+    if (dst == nullptr || src == nullptr || cap == 0) return;
+    size_t used = 0;
+    while (used < cap && dst[used] != '\0') used++;   // bounded, dst stays terminated
+    if (used >= cap - 1) return;                       // no room left; keep existing text
+    ::strncat(dst, src, cap - used - 1);
+}
+
+// Section markers in cheat files come in two flavours and both are honoured:
+//   * opcode style: first opcode word 0x20000000 = begin, 0x20000001 = end;
+//   * name style : readable_name "--SectionStart:<title>--" /
+//                  "--SectionEnd:<title>--" with an all-zero opcode body.
+// The name-style markers were previously treated as ordinary (zero-offset)
+// cheats, which both defeated the collapse and let a stray "+" bookmark them.
+static bool IsSectionBegin(const DmntCheatEntry &e) {
+    if (e.definition.num_opcodes > 0 && e.definition.opcodes[0] == 0x20000000)
+        return true;
+    return std::strncmp(e.definition.readable_name, "--SectionStart", 14) == 0;
+}
+static bool IsSectionEnd(const DmntCheatEntry &e) {
+    if (e.definition.num_opcodes > 0 && e.definition.opcodes[0] == 0x20000001)
+        return true;
+    return std::strncmp(e.definition.readable_name, "--SectionEnd", 12) == 0;
+}
+// Title shown on the collapsed group row: text between ':' and the trailing
+// "--" for name-style markers, otherwise the cheat's own readable name.
+static std::string SectionTitle(const DmntCheatEntry &e) {
+    std::string n(e.definition.readable_name);
+    size_t c = n.find(':');
+    if (c != std::string::npos) {
+        std::string t = n.substr(c + 1);
+        size_t d = t.rfind("--");
+        if (d != std::string::npos) t = t.substr(0, d);
+        return t;
+    }
+    return n;
+}
+// Ordinal of a cheat among the real (non-marker) cheats, i.e. its position with
+// all --SectionStart/--SectionEnd rows removed. Used for the info line so a
+// section marker is never "counted as a cheat id". Returns -1 when the index
+// itself is a marker (an empty group).
+static s32 RealCheatOrdinal(u32 target) {
+    s32 ord = -1;
+    u32 n = 0;
+    for (u32 i = 0; i < m_cheatCnt; i++) {
+        if (IsSectionBegin(m_cheats[i]) || IsSectionEnd(m_cheats[i])) continue;
+        if (i == target) { ord = (s32)n; break; }
+        n++;
+    }
+    return ord;
+}
+
+// Resolve the highlighted row of the flat view to its raw m_cheats index, or
+// 0xFFFFFFFF when there is nothing to point at (empty list / stale map).
+static inline u32 FlatSelectedRaw() {
+    if (m_flat_row_count == 0)
+        return 0xFFFFFFFFu;
+    u32 row = m_cheat_index;
+    if (row >= m_flat_row_count)
+        row = m_flat_row_count - 1;
+    return m_flat_row_raw[row];
 }
 
 bool addbookmark() {
     u32 index = m_cheat_index + m_cheatlist_offset;
     if (m_outline_mode) {
+        if (m_cheat_outline.empty()) return false;
+        if (index >= m_cheat_outline.size()) index = (u32)m_cheat_outline.size() - 1;
+        // The cursor is on a collapsed group header (a --SectionStart marker):
+        // it is not a real cheat, so there is nothing meaningful to bookmark.
+        if (m_cheat_outline[index].is_outline) return false;
         index = m_cheat_outline[index].index;
+    } else {
+        // Flat view: resolve the highlighted real cheat through the row map,
+        // which already excludes section markers.
+        index = FlatSelectedRaw();
+        if (index == 0xFFFFFFFFu) return false;
     }
+    // Final safety net: never index m_cheats[] past its allocated count.
+    if (m_cheats == nullptr || index >= (u32)m_cheatCnt) return false;
+    // Never turn a section marker into a bookmark (flat/non-outline mode has no
+    // is_outline rows, so guard the underlying cheat here too).
+    if (IsSectionBegin(m_cheats[index]) || IsSectionEnd(m_cheats[index])) return false;
     DmntCheatDefinition cheat = m_cheats[index].definition;
     bookmark_t bookmark;
-    memcpy(&bookmark.label, &cheat.readable_name, sizeof(bookmark.label));
-    if ((bookmark.label[18] & 0xC0) == 0xC0) {
-        bookmark.label[18] = 0;
-    } else if ((bookmark.label[17] & 0xE0) == 0xE0) {
-        bookmark.label[17] = 0;
-        bookmark.label[18] = 0;
-    } else if ((bookmark.label[16] & 0xF0) == 0xF0) {
-        bookmark.label[16] = 0;
-        bookmark.label[17] = 0;
-        bookmark.label[18] = 0;
+    // Force a NUL-terminated copy: cheat.readable_name is 0x40 bytes and
+    // bookmark.label is only 19 bytes. Without explicit termination a name
+    // that fills the buffer makes downstream snprintf/"%s" reads run past
+    // label[] into the rest of bookmark_t.
+    std::memcpy(bookmark.label, cheat.readable_name, sizeof(bookmark.label) - 1);
+    // Trim a trailing incomplete UTF-8 sequence. label[0..L-1] are the copied
+    // bytes and label[L] holds the NUL (L = sizeof - 1). If the copy was cut in
+    // the middle of a multi-byte character, the leftover lead/continuation bytes
+    // would render as mojibake, so walk back to the final code point's lead byte
+    // and drop the whole partial tail. This supersedes the old three-way
+    // label[18]/[17]/[16] heuristic, whose first case became dead once label[18]
+    // was forced to 0 and which missed a trailing 2-byte lead.
+    const size_t L = sizeof(bookmark.label) - 1;
+    size_t k = L;
+    while (k > 0 && (static_cast<u8>(bookmark.label[k - 1]) & 0xC0) == 0x80)
+        k--;                                   // skip trailing continuation bytes
+    if (k > 0) {
+        u8 lead = static_cast<u8>(bookmark.label[k - 1]);
+        size_t need = 1;                       // total bytes this lead implies
+        if      ((lead & 0xE0) == 0xC0) need = 2;
+        else if ((lead & 0xF0) == 0xE0) need = 3;
+        else if ((lead & 0xF8) == 0xF0) need = 4;
+        if (L - (k - 1) < need) k--;           // incomplete -> also drop the lead
     }
+    bookmark.label[k] = 0;
     bookmark.pointer.depth = 0;
     bookmark.deleted = false;
     bool success = false;
@@ -960,7 +1379,10 @@ bool addbookmark() {
     u64 depth = 0;
     bool no7 = true;
 
-    for (u8 i = 0; i < cheat.num_opcodes; i++) {
+    // num_opcodes is u32 (MaxOpcodes = 0x100). Using u8 here would wrap to 0
+    // when num_opcodes == 256 and spin forever, and the in-body `i++`/`i+=2`
+    // bumps can also overflow an u8. Use u32 to match the array capacity.
+    for (u32 i = 0; i < cheat.num_opcodes; i++) {
         u8 opcode = (cheat.opcodes[i] >> 28) & 0xF;
         u8 FSA = (cheat.opcodes[i] >> 12) & 0xF;
         u8 T = (cheat.opcodes[i] >> 24) & 0xF;
@@ -1043,12 +1465,14 @@ bool addbookmark() {
                     break;
                 case 4:
                     bookmark.type = SEARCH_TYPE_UNSIGNED_32BIT;
-                    if (((cheat.opcodes[i + 2] & 0xF0000000) == 0x40000000) || ((cheat.opcodes[i + 2] & 0xF0000000) == 0x30000000) || ((cheat.opcodes[i + 2] & 0xF0000000) == 0xC0000000))
+                    if ((i + 2 < cheat.num_opcodes) &&
+                        (((cheat.opcodes[i + 2] & 0xF0000000) == 0x40000000) || ((cheat.opcodes[i + 2] & 0xF0000000) == 0x30000000) || ((cheat.opcodes[i + 2] & 0xF0000000) == 0xC0000000)))
                         bookmark.type = SEARCH_TYPE_FLOAT_32BIT;
                     break;
                 case 8:
                     bookmark.type = SEARCH_TYPE_UNSIGNED_64BIT;
-                    if (((cheat.opcodes[i + 1] & 0xF0000000) == 0x40000000) || ((cheat.opcodes[i + 1] & 0xF0000000) == 0x30000000) || ((cheat.opcodes[i + 1] & 0xF0000000) == 0xC0000000))
+                    if ((i + 1 < cheat.num_opcodes) &&
+                        (((cheat.opcodes[i + 1] & 0xF0000000) == 0x40000000) || ((cheat.opcodes[i + 1] & 0xF0000000) == 0x30000000) || ((cheat.opcodes[i + 1] & 0xF0000000) == 0xC0000000)))
                         bookmark.type = SEARCH_TYPE_FLOAT_64BIT;
                     break;
                 default:
@@ -1070,10 +1494,7 @@ bool addbookmark() {
             nextaddress += bookmark.pointer.offset[z];
             MemoryInfo meminfo = m_debugger->queryMemory(nextaddress);
             if (meminfo.perm == Perm_Rw) {
-                if (m_32bitmode)
-                    m_debugger->readMemory(&nextaddress, sizeof(u32), nextaddress);
-                else
-                    m_debugger->readMemory(&nextaddress, sizeof(u64), nextaddress);
+                nextaddress = ReadPointerStep(m_debugger.get(), nextaddress);
             } else {
                 success = false;
             }
@@ -1095,62 +1516,115 @@ void getcheats() {
     m_displayed_cheat_lines = 0;
     char ss[200] = "";
     if (refresh_cheats) {
-        if (m_cheatCnt != 0) {
-            delete m_cheats;
-            m_cheats = nullptr;
-        }
+        m_cheats.reset();
+        m_cheatCnt = 0;
         dmntchtGetCheatCount(&m_cheatCnt);
+        bool need_apply_toggles = false;
         if (m_cheatCnt == 0) {
+            // Fresh library (re)loaded into dmnt: all cheat indices restart, so any
+            // remembered expansion would map onto the wrong sections.
+            m_expanded_groups.clear();
             loadcheatsfromfile();
             dmntchtGetCheatCount(&m_cheatCnt);
+            // Mark that we just freshly populated dmnt from the cheats .txt; the
+            // persisted enabled/disabled state in toggles.brz has to be reapplied
+            // once m_cheats is available (loadtoggles() looks cheats up by name
+            // in the m_cheats cache).
+            need_apply_toggles = true;
         }
         if (m_cheatCnt > 0) {
-            m_cheats = new DmntCheatEntry[m_cheatCnt];
-            dmntchtGetCheats(m_cheats, m_cheatCnt, 0, &m_cheatCnt);
+            m_cheats = std::make_unique<DmntCheatEntry[]>(m_cheatCnt);
+            dmntchtGetCheats(m_cheats.get(), m_cheatCnt, 0, &m_cheatCnt);
+            if (need_apply_toggles) {
+                // Re-apply the persisted enabled/disabled state recorded in
+                // toggles.brz. Without this call savetoggles() output is dead
+                // data and every reload starts with all cheats unchecked.
+                loadtoggles();
+                // Refresh the local cache so the rendered checkboxes match dmnt.
+                dmntchtGetCheats(m_cheats.get(), m_cheatCnt, 0, &m_cheatCnt);
+            }
+            // Recompute total_opcode here so that the A-button cap check in
+            // handleInput() works correctly in outline mode too. The previous
+            // location was below an early `return` when m_outline_mode==true,
+            // which let users exceed MaximumProgramOpcodeCount and made the
+            // dmnt side silently keep stale copies of cheats that the UI
+            // could no longer disable.
+            total_opcode = 0;
+            for (u32 i = 0; i < m_cheatCnt; i++)
+                if (m_cheats[i].enabled) total_opcode += m_cheats[i].definition.num_opcodes;
+            // Refresh cheat_ids in m_toggle_list whenever the dmnt list has
+            // been re-fetched. Add/Remove operations reassign ids, so without
+            // this the key-combo shortcuts would silently toggle wrong cheats.
+            ReconcileToggleList();
+            // m_cheats was just re-read from dmnt, so .enabled reflects the
+            // authoritative state (including the user's latest toggle). Persist
+            // it so a future reload-from-file + loadtoggles() can't resurrect a
+            // cheat the user unchecked. savetoggles() writes the whole list, so
+            // one flag covers any number of toggles made this session.
+            if (save_toggles_to_file) {
+                savetoggles();
+                save_toggles_to_file = false;
+            }
         } else {
             CheatsLabelsStr[0] = 0;
             CheatsEnableStr[0] = 0;
             snprintf(CheatsEnableStr, sizeof CheatsEnableStr, "NoAvailableCheatsErrorGetCheatsCheatsEnableStrText"_tr.c_str());
             cheat_outline_entry_t outline_entry = {};
             m_cheat_outline.push_back(outline_entry);
+            m_flat_row_count = 0;
             return;
         }
         refresh_cheats = false;
         // make outline
         if (m_outline_refresh) {
-            m_outline_refresh = false;    
-            bool hide_entry = false;
+            m_outline_refresh = false;
             m_cheat_outline.clear();
-            cheat_outline_entry_t cheat_outline_entry = {};
-            for (u32 i = 0; i < m_cheatCnt; i++) {
-                auto entry = m_cheats[i];
-                if (entry.definition.opcodes[0] == 0x20000000 || entry.definition.opcodes[0] == 0x20000001) { // 0x20000001 is end outline code
-                    if (cheat_outline_entry.is_outline) {
-                        cheat_outline_entry.size = i - cheat_outline_entry.index - 1;
-                        m_cheat_outline.push_back(cheat_outline_entry);
-                    }
-                    cheat_outline_entry.index = i;
-                    cheat_outline_entry.is_outline = true;
-                    if (entry.definition.opcodes[0] == 0x20000000) {
-                        cheat_outline_entry.always_expanded = false;
-                        cheat_outline_entry.expanded = false;
-                        hide_entry = true;
-                    } else {
-                        cheat_outline_entry.expanded = true;
-                        cheat_outline_entry.always_expanded = true;
-                        if (show_outline_off) m_cheat_outline.push_back(cheat_outline_entry); // comment out this line to not show this type of outline
-                        hide_entry = false;
-                    }
-                } else if (!hide_entry) {
-                    cheat_outline_entry.index = i;
-                    cheat_outline_entry.is_outline = false;
-                    m_cheat_outline.push_back(cheat_outline_entry);
+            // Emit one collapsible group per --SectionStart/--SectionEnd (or
+            // opcode 0x20000000/0x20000001) pair. The marker rows themselves are
+            // never shown: the begin becomes the group header, the end is
+            // consumed. A group's children are rendered only when it is expanded,
+            // which is driven by the authoritative m_expanded_groups set (so a
+            // rebuild after a toggle/delete reproduces the exact same view).
+            auto pushGroup = [&](s32 begin, u32 endExclusive, bool collapsible) {
+                bool expanded = !collapsible;              // malformed groups stay open
+                if (collapsible) {
+                    for (auto b : m_expanded_groups)
+                        if (b == (u32)begin) { expanded = true; break; }
                 }
-            }
-            if (cheat_outline_entry.is_outline) {
-                cheat_outline_entry.size = m_cheatCnt - 1 - cheat_outline_entry.index;
-                m_cheat_outline.push_back(cheat_outline_entry);
+                cheat_outline_entry_t h = {};
+                h.index = (u32)begin;
+                h.is_outline = true;
+                h.always_expanded = !collapsible;
+                h.expanded = expanded;
+                h.size = endExclusive - (u32)begin - 1;
+                h.title = SectionTitle(m_cheats[begin]);
+                m_cheat_outline.push_back(h);
+                if (expanded) {   // malformed, or a user-expanded group: inline contents
+                    for (u32 k = (u32)begin + 1; k < endExclusive; k++)
+                        if (!IsSectionBegin(m_cheats[k]) && !IsSectionEnd(m_cheats[k])) {
+                            cheat_outline_entry_t e = {};
+                            e.index = k;
+                            e.is_outline = false;
+                            m_cheat_outline.push_back(e);
+                        }
+                }
             };
+            s32 open_begin = -1;
+            for (u32 i = 0; i < m_cheatCnt; i++) {
+                if (IsSectionBegin(m_cheats[i])) {
+                    if (open_begin >= 0) pushGroup(open_begin, i, false);  // defensive
+                    open_begin = (s32)i;
+                } else if (IsSectionEnd(m_cheats[i])) {
+                    if (open_begin >= 0) { pushGroup(open_begin, i, true); open_begin = -1; }
+                } else if (open_begin < 0) {                                 // outside any group
+                    cheat_outline_entry_t e = {};
+                    e.index = i;
+                    e.is_outline = false;
+                    m_cheat_outline.push_back(e);
+                }
+                // inside a group (open_begin >= 0): content stays hidden for now
+            }
+            if (open_begin >= 0) pushGroup(open_begin, (u32)m_cheatCnt, false);  // trailing
         }
     }
     if (m_outline_mode && !m_show_only_enabled_cheats) { // take over and ignore the rest
@@ -1159,10 +1633,33 @@ void getcheats() {
         CheatsEnableStr[0] = 0;
         snprintf(CheatsLabelsStr, sizeof CheatsLabelsStr, "\n");
         snprintf(CheatsEnableStr, sizeof CheatsEnableStr, "\n");
+        // Section markers are bookkeeping rows, not cheats: they must not be
+        // counted in the enabled/total tally, nor surface their own cheat id.
         u32 Enable_count = 0;
-        for (u8 i = 0; i < m_cheatCnt; i++)
+        u32 Real_count = 0;
+        for (u32 i = 0; i < m_cheatCnt; i++) {
+            if (IsSectionBegin(m_cheats[i]) || IsSectionEnd(m_cheats[i])) continue;
+            Real_count++;
             if (m_cheats[i].enabled) Enable_count++;
-        snprintf(CheatsCursor, sizeof CheatsCursor, "BasicInfoGetCheatsCheatsCursorText"_tr.c_str(), m_cheats[m_cheat_outline[m_cheat_index + m_cheatlist_offset].index].cheat_id, Enable_count, m_cheatCnt);
+        }
+        // Resolve the highlighted row to a real cheat: a group header reports its
+        // first child's ordinal instead of the marker, so moving onto a collapsed
+        // label no longer reads as "one more cheat id".
+        u32 oi = m_cheat_index + m_cheatlist_offset;
+        if (oi >= m_cheat_outline.size()) oi = m_cheat_outline.empty() ? 0 : (u32)m_cheat_outline.size() - 1;
+        u32 hl_index = m_cheat_outline[oi].index;
+        if (m_cheat_outline[oi].is_outline) {
+            u32 first = hl_index + 1;
+            if (first < (u32)m_cheatCnt &&
+                !IsSectionBegin(m_cheats[first]) && !IsSectionEnd(m_cheats[first]))
+                hl_index = first;
+        }
+        // Show the id 1-based: RealCheatOrdinal is 0-based internally (it maps
+        // to dmnt order), but users find "Cheat #1" for the first entry more
+        // intuitive. -1 (an empty group header) falls back to 0.
+        s32 display_id = RealCheatOrdinal(hl_index);
+        display_id = (display_id >= 0) ? (display_id + 1) : 0;
+        snprintf(CheatsCursor, sizeof CheatsCursor, "BasicInfoGetCheatsCheatsCursorText"_tr.c_str(), display_id, Enable_count, (long)Real_count);
         for (u8 line = 0; line < NUM_cheats; line++) {
             if ((line + m_cheatlist_offset) >= m_cheat_outline.size())
                 break;
@@ -1172,7 +1669,18 @@ void getcheats() {
                 char toggle_str[100] = "";
                 if (!m_show_only_enabled_cheats) {
                     for (size_t i = 0; i < m_toggle_list.size(); i++) {
-                        if (m_toggle_list[i].cheat_id == m_cheats[line + m_cheatlist_offset].cheat_id) {
+                        // Match by stable readable_name when available; fall
+                        // back to cheat_id comparison only for legacy entries
+                        // that have no persisted name. NOTE: outline mode keeps
+                        // a separate indirection (m_cheat_outline -> m_cheats),
+                        // so we must look up the cheat through that mapping or
+                        // the rendered combo label drifts off its row when an
+                        // outline is collapsed.
+                        const char *cur_name = cheat_entry.definition.readable_name;
+                        bool same = (m_toggle_list[i].name[0] != 0)
+                            ? (std::strncmp(m_toggle_list[i].name, cur_name, sizeof(m_toggle_list[i].name)) == 0)
+                            : (m_toggle_list[i].cheat_id == cheat_entry.cheat_id);
+                        if (same) {
                             bool match = false;
                             for (u32 j = 0; j < buttonCodes.size(); j++) {
                                 if ((m_toggle_list[i].keycode & buttonCodes[j]) == (buttonCodes[j] & 0x0FFFFFFF)) {
@@ -1196,13 +1704,19 @@ void getcheats() {
                     snprintf(ss, sizeof ss, "\n");
                     strcat(CheatsEnableStr, ss);
                 } else {
-                    if (cheat_entry.definition.opcodes[0] == 0x20000000) {
-                        snprintf(ss, sizeof ss, "[%s%s %s] %d\n", namestr, cheat_entry.definition.readable_name, toggle_str, m_cheat_outline[line + m_cheatlist_offset].size);
-                        strcat(CheatsLabelsStr, "\n");
-                        strcat(CheatsEnableStr, ss);
-                    } else if (cheat_entry.definition.opcodes[0] == 0x20000001) {
-                        snprintf(ss, sizeof ss, "OutlineClosedGetCheatsCheatsLabelsStrText"_tr.c_str(), cheat_entry.definition.readable_name);
-                        strcat(CheatsLabelsStr, "\n");
+                    const cheat_outline_entry_t &oe = m_cheat_outline[line + m_cheatlist_offset];
+                    if (oe.is_outline) {
+                        // Section group header: show the extracted title in the
+                        // name column and keep the checkbox column blank — the
+                        // marker itself is not toggleable, so it must not render
+                        // as a regular cheat row (this is what made the raw
+                        // --SectionStart/--SectionEnd lines show up before).
+                        std::string title = oe.title.empty()
+                            ? std::string(cheat_entry.definition.readable_name) : oe.title;
+                        const char *arrow = (oe.expanded || oe.always_expanded) ? "\u25BC" : "\u25B6";
+                        snprintf(ss, sizeof ss, "%s %s (%d)\n", arrow, title.c_str(), (int)oe.size);
+                        strcat(CheatsLabelsStr, ss);
+                        snprintf(ss, sizeof ss, "\n");
                         strcat(CheatsEnableStr, ss);
                     } else {
                         snprintf(ss, sizeof ss, "%s%s %s\n", namestr, cheat_entry.definition.readable_name, toggle_str);
@@ -1222,6 +1736,61 @@ void getcheats() {
         return;
     }
     // End make outline
+
+    // Flat view (outline mode returned above). Build the screen-row -> raw index
+    // map for this pass with a LOCAL cursor: skip section markers, and in the
+    // enabled-only view skip disabled cheats. m_cheatlist_offset is the
+    // persistent raw scroll base and is NEVER mutated here -- the previous design
+    // bumped it to hide markers, but getcheats() runs every frame in this view, so
+    // the skips accumulated, drifted the offset past m_cheatCnt and blanked the
+    // whole list (both the show-all/X path and Y entered it, hence identical
+    // symptoms). The renderer and actions read m_flat_row_raw / FlatSelectedRaw.
+    {
+        // Build the visible window; if the base lands past the last selectable
+        // cheat (e.g. entering flat onto a trailing --SectionEnd marker after
+        // a delete shrunk the array) the loop yields zero rows and the view
+        // appears blank. Retry once from the top so the flat view is never
+        // empty while real cheats exist.
+        for (u32 attempt = 0; attempt < 2; attempt++) {
+            u32 s = m_cheatlist_offset;
+            m_flat_row_count = 0;
+            for (u8 line = 0; line < NUM_cheats; line++) {
+                while (s < (u32)m_cheatCnt && (IsSectionBegin(m_cheats[s]) || IsSectionEnd(m_cheats[s])))
+                    s++;
+                if (m_show_only_enabled_cheats)
+                    while (s < (u32)m_cheatCnt && !m_cheats[s].enabled)
+                        s++;
+                if (s >= (u32)m_cheatCnt)
+                    break;
+                m_flat_row_raw[line] = s;
+                m_flat_row_count = line + 1;
+                s++;
+            }
+            if (m_flat_row_count > 0 || m_cheatlist_offset == 0) break;
+            m_cheatlist_offset = 0;   // self-heal, retry from the top
+        }
+        m_real_cheat_count = 0;
+        m_last_real_raw = 0;
+        bool any_selectable = false;
+        for (u32 i = 0; i < (u32)m_cheatCnt; i++) {
+            if (IsSectionBegin(m_cheats[i]) || IsSectionEnd(m_cheats[i]))
+                continue;
+            m_real_cheat_count++;                                     // marker-free total (info line)
+            if (m_show_only_enabled_cheats && !m_cheats[i].enabled)    // honor the view filter
+                continue;
+            m_last_real_raw = i;
+            any_selectable = true;
+        }
+        if (!any_selectable)
+            m_last_real_raw = 0;
+        // Keep the highlighted row on a real, visible entry. Navigation can push
+        // m_cheat_index past the (partial) last window; clamp it back so the cursor
+        // never sits after the final cheat. This runs every frame in getcheats(),
+        // so it self-corrects regardless of the update()/handleInput() order.
+        if (m_cheat_index >= m_flat_row_count)
+            m_cheat_index = (m_flat_row_count > 0) ? (m_flat_row_count - 1) : 0;
+    }
+
     if (m_show_only_enabled_cheats) {
         if (m_displayed_cheat_lines > 0) {
         snprintf(CheatsEnableStr, sizeof CheatsEnableStr, "\n");
@@ -1235,9 +1804,14 @@ void getcheats() {
         }
     } else {
         total_opcode = 0;
-        for (u8 i = 0; i < m_cheatCnt; i++)
+        for (u32 i = 0; i < m_cheatCnt; i++)
             if (m_cheats[i].enabled) total_opcode += m_cheats[i].definition.num_opcodes;
-        snprintf(CheatsCursor, sizeof CheatsCursor, "ShowTotalInfoGetCheatsCheatsCursorText"_tr.c_str(), m_cheat_index + m_cheatlist_offset + 1, m_cheatCnt, m_cheats[m_cheat_index + m_cheatlist_offset].definition.num_opcodes, total_opcode, MaximumProgramOpcodeCount);
+        // Report the highlighted real cheat 1-based (skipping markers) and the
+        // marker-free total, matching the outline view's convention.
+        u32 sel = FlatSelectedRaw();
+        u32 sel_num = (sel == 0xFFFFFFFFu) ? 0 : m_cheats[sel].definition.num_opcodes;
+        s32 disp_id = (sel == 0xFFFFFFFFu) ? 0 : (RealCheatOrdinal(sel) + 1);
+        snprintf(CheatsCursor, sizeof CheatsCursor, "ShowTotalInfoGetCheatsCheatsCursorText"_tr.c_str(), disp_id, (long)m_real_cheat_count, sel_num, total_opcode, MaximumProgramOpcodeCount);
         snprintf(CheatsLabelsStr, sizeof CheatsLabelsStr, "\n");
         snprintf(CheatsEnableStr, sizeof CheatsEnableStr, "\n");
     }
@@ -1256,20 +1830,26 @@ void getcheats() {
     }
 
     for (u8 line = 0; line < NUM_cheats; line++) {
-        while (m_show_only_enabled_cheats && !(m_cheats[line + m_cheatlist_offset].enabled)){
-             m_cheatlist_offset ++;
-             if ((line + m_cheatlist_offset) >= m_cheatCnt)
-                 break;
-        }
-        if ((line + m_cheatlist_offset) >= m_cheatCnt)
+        // Rows were resolved by the map above (section markers, and disabled
+        // cheats in the enabled-only view, are already excluded there). Read
+        // m_flat_row_raw[] directly and NEVER mutate m_cheatlist_offset.
+        if (line >= m_flat_row_count)
             break;
-        if (!m_showALlCheats && m_outline_index < (m_outline.size() - 1) && m_outline[m_outline_index + 1].index  < m_cheats[line + m_cheatlist_offset].cheat_id + 1 - m_cheats[0].cheat_id) break;
+        u32 ri = m_flat_row_raw[line];
+        if (!m_showALlCheats && m_outline_index < (m_outline.size() - 1) && m_outline[m_outline_index + 1].index  < m_cheats[ri].cheat_id + 1 - m_cheats[0].cheat_id) break;
         {   
             char namestr[100] = "";
             char toggle_str[100] = "";
             if (!m_show_only_enabled_cheats) {
                 for (size_t i = 0; i < m_toggle_list.size(); i++) {
-                    if (m_toggle_list[i].cheat_id == m_cheats[line + m_cheatlist_offset].cheat_id) {
+                    // See note above in outline-mode renderer: prefer matching
+                    // by readable_name so re-assigned cheat_ids don't break the
+                    // on-screen key combo label.
+                    const char *cur_name = m_cheats[ri].definition.readable_name;
+                    bool same = (m_toggle_list[i].name[0] != 0)
+                        ? (std::strncmp(m_toggle_list[i].name, cur_name, sizeof(m_toggle_list[i].name)) == 0)
+                        : (m_toggle_list[i].cheat_id == m_cheats[ri].cheat_id);
+                    if (same) {
                         bool match = false;
                         for (u32 j = 0; j < buttonCodes.size(); j++) {
                             if ((m_toggle_list[i].keycode & buttonCodes[j]) == (buttonCodes[j] & 0x0FFFFFFF)) {
@@ -1281,7 +1861,7 @@ void getcheats() {
                     }
                 }
             }
-            int buttoncode = m_cheats[line + m_cheatlist_offset].definition.opcodes[0];
+            int buttoncode = m_cheats[ri].definition.opcodes[0];
             if ((buttoncode & 0xF0000000) == 0x80000000)
                 for (u32 i = 0; i < buttonCodes.size(); i++) {
                     if ((buttoncode & buttonCodes[i]) == buttonCodes[i])
@@ -1293,19 +1873,13 @@ void getcheats() {
                 snprintf(ss, sizeof ss, "\n");
                 strcat(CheatsEnableStr, ss);
             } else {
-                if (m_cheats[line + m_cheatlist_offset].definition.opcodes[0] == 0x20000000) {
-                    snprintf(ss, sizeof ss, "[%s%s %s]\n", namestr, m_cheats[line + m_cheatlist_offset].definition.readable_name, toggle_str);
-                    strcat(CheatsLabelsStr, "\n");
-                    strcat(CheatsEnableStr, ss);
-                } else {
-                    snprintf(ss, sizeof ss, "%s%s %s\n", namestr, m_cheats[line + m_cheatlist_offset].definition.readable_name, toggle_str);
-                    strcat(CheatsLabelsStr, ss);
-                    if (m_show_only_enabled_cheats)
-                        snprintf(ss, sizeof ss, "\n");
-                    else
-                        snprintf(ss, sizeof ss, "%s\n", (m_cheats[line + m_cheatlist_offset].enabled) ? "\u25A0" : "\u25A1");
-                    strcat(CheatsEnableStr, ss);
-                }
+                snprintf(ss, sizeof ss, "%s%s %s\n", namestr, m_cheats[ri].definition.readable_name, toggle_str);
+                strcat(CheatsLabelsStr, ss);
+                if (m_show_only_enabled_cheats)
+                    snprintf(ss, sizeof ss, "\n");
+                else
+                    snprintf(ss, sizeof ss, "%s\n", (m_cheats[ri].enabled) ? "\u25A0" : "\u25A1");
+                strcat(CheatsEnableStr, ss);
             }
             snprintf(ss, sizeof ss, "%s\n", ((m_cheat_index == line) && (!m_show_only_enabled_cheats) && !m_cursor_on_bookmark) ? "\uE019" : "");
             strcat(CheatsCursor, ss);
@@ -1329,10 +1903,12 @@ void getcheats() {
 
 class BookmarkOverlay : public tsl::Gui {
 private:
-	uint64_t bookmarkEnableCheatCombo = MapButtons(strBookmarkEnableCheatCombo);
-    uint64_t bookmarkPauseCheatCombo = MapButtons(strBookmarkPauseCheatCombo);
-    uint64_t bookmarkIncreaseFontSizeCombo = MapButtons(strBookmarkIncreaseFontSizeCombo);
-    uint64_t bookmarkDecreaseFontSizeCombo = MapButtons(strBookmarkDecreaseFontSizeCombo);
+	// Use the pre-parsed global masks (refreshed in ParseIniFile) rather than
+	// re-running MapButtons() at every Gui construction.
+	uint64_t bookmarkEnableCheatCombo = g_bookmarkEnableCheatCombo;
+    uint64_t bookmarkPauseCheatCombo = g_bookmarkPauseCheatCombo;
+    uint64_t bookmarkIncreaseFontSizeCombo = g_bookmarkIncreaseFontSizeCombo;
+    uint64_t bookmarkDecreaseFontSizeCombo = g_bookmarkDecreaseFontSizeCombo;
 
 public:
     BookmarkOverlay() {}
@@ -1400,7 +1976,7 @@ public:
                                     address = nextaddress;
                                 }
                             } else
-                                m_debugger->readMemory(&nextaddress, ((m_32bitmode) ? sizeof(u32) : sizeof(u64)), nextaddress);
+                                nextaddress = ReadPointerStep(m_debugger.get(), nextaddress);
                         else {
                             break;
                         }
@@ -1409,7 +1985,7 @@ public:
                     address = ((bookmark.heap) ? ((m_debugger->queryMemory(metadata.heap_extents.base).type == 0) ? metadata.alias_extents.base : metadata.heap_extents.base) : metadata.main_nso_extents.base) + bookmark.offset;
                 }
                 searchValue_t value = {0};
-                m_debugger->readMemory(&value, dataTypeSizes[bookmark.type], address);
+                m_debugger->readMemory(&value, DataTypeSize(bookmark.type), address);
                 if ((m_oldvalue[line]._u64 == 0) || (m_oldvalue[line]._s64 > value._s64))
                     m_oldvalue[line]._s64 = value._s64;
                 else if (bookmark.multiplier != 1) {
@@ -1438,9 +2014,9 @@ public:
                             };
                             break;
                     };
-                    m_debugger->writeMemory(&(m_oldvalue[line]), dataTypeSizes[bookmark.type], address);
+                    m_debugger->writeMemory(&(m_oldvalue[line]), DataTypeSize(bookmark.type), address);
                 }
-                snprintf(ss, sizeof ss, "%s\n", _getAddressDisplayString(address, m_debugger, (searchType_t)bookmark.type).c_str());
+                snprintf(ss, sizeof ss, "%s\n", _getAddressDisplayString(address, m_debugger.get(), (searchType_t)bookmark.type).c_str());
                 strcat(Variables, ss);
                 snprintf(ss, sizeof ss, "%s\n", bookmark.label);
                 strcat(BookmarkLabels, ss);
@@ -1461,13 +2037,28 @@ public:
             return true;
         }
 
-        for (auto entry : m_toggle_list) {
+        for (const auto &entry : m_toggle_list) {
             if (((keysHeld | keysDown) == entry.keycode) && (keysDown & entry.keycode)) {
-                dmntchtToggleCheat(entry.cheat_id);
-                refresh_cheats = true;
+                // Resolve the live cheat_id by stable name first. Cached
+                // entry.cheat_id can be stale after Add/Remove cycles, which
+                // previously caused key combos to silently toggle a different
+                // cheat (and look like "disable doesn't work").
+                u32 live_id = 0;
+                bool ambiguous = false;
+                if (LookupCheatIdByName(entry.name, &live_id, &ambiguous)) {
+                    dmntchtToggleCheat(ambiguous ? entry.cheat_id : live_id);
+                    save_toggles_to_file = true;
+                    refresh_cheats = true;
+                } else if (entry.name[0] == 0) {
+                    // Legacy entry without a persisted name: fall back to the
+                    // id we loaded from .bz1.
+                    dmntchtToggleCheat(entry.cheat_id);
+                    save_toggles_to_file = true;
+                    refresh_cheats = true;
+                }
             }
         }
-        if (isKeyComboPressed(keysHeld, keysDown, bookmarkEnableCheatCombo)) {
+        if (isKeyComboJustPressed(keysHeld, keysDown, bookmarkEnableCheatCombo)) {
             m_cheatlist_offset = m_cheatlist_offset_save;
             TeslaFPS = 50;
             IsFrameBackground = false;
@@ -1477,7 +2068,7 @@ public:
             tsl::goBack();
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, bookmarkPauseCheatCombo)) {
+        if (isKeyComboJustPressed(keysHeld, keysDown, bookmarkPauseCheatCombo)) {
             m_cheatlist_offset = m_cheatlist_offset_save;
             TeslaFPS = 50;
             IsFrameBackground = false;
@@ -1488,11 +2079,11 @@ public:
             tsl::goBack();
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, bookmarkIncreaseFontSizeCombo)) {
+        if (isKeyComboJustPressed(keysHeld, keysDown, bookmarkIncreaseFontSizeCombo)) {
             fontsize++;
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, bookmarkDecreaseFontSizeCombo)) {
+        if (isKeyComboJustPressed(keysHeld, keysDown, bookmarkDecreaseFontSizeCombo)) {
             fontsize--;
             return true;
         }
@@ -1503,20 +2094,21 @@ public:
 //Main Menu
 class MainMenu : public tsl::Gui {
 private:
-	uint64_t mainMenuChangeToBookmarkCombo = MapButtons(strMainMenuChangeToBookmarkCombo);
-    uint64_t mainMenuIncreaseFontSizeCombo = MapButtons(strMainMenuIncreaseFontSizeCombo);
-    uint64_t mainMenuDecreaseFontSizeCombo = MapButtons(strMainMenuDecreaseFontSizeCombo);
-    uint64_t mainMenuOutlineModeSwitchesCombo = MapButtons(strMainMenuOutlineModeSwitchesCombo);
-    uint64_t mainMenuSetBookmarkMultipier = MapButtons(strMainMenuSetBookmarkMultipier);
-    uint64_t mainMenuNextLabel = MapButtons(strMainMenuNextLabel);
-    uint64_t mainMenuPreviousLabel = MapButtons(strMainMenuPreviousLabel);
+	// Pre-parsed global masks (refreshed in ParseIniFile); avoids re-running
+	// MapButtons() on every Gui construction.
+	uint64_t mainMenuChangeToBookmarkCombo = g_mainMenuChangeToBookmarkCombo;
+    uint64_t mainMenuIncreaseFontSizeCombo = g_mainMenuIncreaseFontSizeCombo;
+    uint64_t mainMenuDecreaseFontSizeCombo = g_mainMenuDecreaseFontSizeCombo;
+    uint64_t mainMenuOutlineModeSwitchesCombo = g_mainMenuOutlineModeSwitchesCombo;
+    uint64_t mainMenuSetBookmarkMultipier = g_mainMenuSetBookmarkMultipier;
+    uint64_t mainMenuNextLabel = g_mainMenuNextLabel;
+    uint64_t mainMenuPreviousLabel = g_mainMenuPreviousLabel;
 public:
     MainMenu() {}
     ~MainMenu() {
         refresh_cheats = false;
         if (m_cheats) {
-            delete m_cheats;
-            m_cheats = nullptr;
+            m_cheats.reset();
             m_cheatCnt = 0;
         }
     }
@@ -1570,8 +2162,13 @@ public:
             }
             rootFrame = new tsl::elm::OverlayFrame("PluginName"_tr, VERSION);
             auto list = new tsl::elm::List();
-            auto NoCheats = new tsl::elm::ListItem("NoDmntMainMenuListItemText"_tr);
-            list->addItem(NoCheats);
+            // dmnt_present tells the two "not working" cases apart: service absent
+            // (dmnt_present false) vs service running but no live cheat process/game
+            // (m_debugger was reset in init_se_tools). Show the accurate message.
+            if (dmnt_present)
+                list->addItem(new tsl::elm::ListItem("GameNotRunningMainMenuListItemText"_tr));
+            else
+                list->addItem(new tsl::elm::ListItem("NoDmntMainMenuListItemText"_tr));
             rootFrame->setContent(list);
         }
 
@@ -1586,7 +2183,16 @@ public:
         if (!m_debugger->m_dmnt)
             return;
 
-        if (m_cheatCnt == 0) {
+        if (m_edit_value) {
+            // Bookmark value editing is a modal text editor: the list footer
+            // keys (notably "B Exit") are wrong here — B is backspace and X
+            // cancels/leaves editing. Build a neutral title/PID-only header that
+            // still occupies the same 5-line block reserved by BookmarkLabels /
+            // Variables / MultiplierStr (so row alignment holds), and let the
+            // edit footer appended further down describe the real keys.
+            snprintf(Cursor, sizeof Cursor, "UpdateEditValueHeaderMainMenuCustomDrawerText"_tr.c_str(),
+                    m_titleName.c_str(), m_versionString.c_str(), metadata.process_id, metadata.title_id, build_id[0], build_id[1], build_id[2], build_id[3], build_id[4], build_id[5], build_id[6], build_id[7]);
+        } else if (m_cheatCnt == 0) {
             snprintf(Cursor, sizeof Cursor, "UpdateCursorNoCheatsMainMenuCustomDrawerText"_tr.c_str(),
                     m_titleName.c_str(), m_versionString.c_str(), metadata.process_id, metadata.title_id, build_id[0], build_id[1], build_id[2], build_id[3], build_id[4], build_id[5], build_id[6], build_id[7]);
         } else if (m_cursor_on_bookmark) {
@@ -1622,7 +2228,7 @@ public:
                                     address = nextaddress;
                                 }
                             } else
-                                m_debugger->readMemory(&nextaddress, ((m_32bitmode) ? sizeof(u32) : sizeof(u64)), nextaddress);
+                                nextaddress = ReadPointerStep(m_debugger.get(), nextaddress);
                         else {
                             break;
                         }
@@ -1631,7 +2237,7 @@ public:
                     address = ((bookmark.heap) ? ((m_debugger->queryMemory(metadata.heap_extents.base).type == 0) ? metadata.alias_extents.base : metadata.heap_extents.base) : metadata.main_nso_extents.base) + bookmark.offset;
                 }
                 searchValue_t value = {0};
-                m_debugger->readMemory(&value, dataTypeSizes[bookmark.type], address);
+                m_debugger->readMemory(&value, DataTypeSize(bookmark.type), address);
                 if ((m_oldvalue[line]._u64 == 0) || (m_oldvalue[line]._s64 > value._s64))
                     m_oldvalue[line]._s64 = value._s64;
                 else if (bookmark.multiplier != 1) {
@@ -1660,9 +2266,9 @@ public:
                             };
                             break;
                     };
-                    m_debugger->writeMemory(&(m_oldvalue[line]), dataTypeSizes[bookmark.type], address);
+                    m_debugger->writeMemory(&(m_oldvalue[line]), DataTypeSize(bookmark.type), address);
                 }
-                snprintf(ss, sizeof ss, "%s\n", ((m_index == line) && m_edit_value) ? valueStr_edit_display(Display).c_str() : _getAddressDisplayString(address, m_debugger, (searchType_t)bookmark.type).c_str());
+                snprintf(ss, sizeof ss, "%s\n", ((m_index == line) && m_edit_value) ? valueStr_edit_display(Display).c_str() : _getAddressDisplayString(address, m_debugger.get(), (searchType_t)bookmark.type).c_str());
                 if (m_index == line) {
                     m_selected_address = address;
                     m_selected_type = bookmark.type;
@@ -1698,30 +2304,32 @@ public:
             }
         }
         if (m_edit_value) {
-            strncat(Cursor, "UpdateEditCheatValueMainMenuCustomDrawerText"_tr.c_str(), sizeof Cursor - 1);
-            strncat(MultiplierStr, "\n", sizeof MultiplierStr - 1);
+            SafeCat(Cursor, sizeof Cursor, ("UpdateEditCheatValueMainMenuCustomDrawerText"_tr).c_str());
+            SafeCat(MultiplierStr, sizeof MultiplierStr, "\n");
             for (u8 i = 0; i < keyNames.size(); i++) {
-                strncat(Cursor, (i == m_value_edit_index) ? "->\n" : "\n", sizeof Cursor - 1);
-                strncat(MultiplierStr, (keyNames[i]+"\n").c_str(), sizeof MultiplierStr - 1);
+                SafeCat(Cursor, sizeof Cursor, (i == m_value_edit_index) ? "->\n" : "\n");
+                SafeCat(MultiplierStr, sizeof MultiplierStr, (keyNames[i]+"\n").c_str());
             }
             return;
         }
         if (m_show_outline) {
-            strncat(Cursor, "UpdateShowOutlineCursorMainMenuCustomDrawerText"_tr.c_str(), sizeof Cursor - 1);
-            strncat(BookmarkLabels, "\n", sizeof BookmarkLabels - 1);
-            strncat(MultiplierStr, "\n", sizeof MultiplierStr - 1);
+            SafeCat(Cursor, sizeof Cursor, ("UpdateShowOutlineCursorMainMenuCustomDrawerText"_tr).c_str());
+            SafeCat(BookmarkLabels, sizeof BookmarkLabels, "\n");
+            SafeCat(MultiplierStr, sizeof MultiplierStr, "\n");
             for (u8 i = 0; i < m_outline.size(); i++) {
-                strncat(Cursor, (i == m_outline_index && !m_cursor_on_bookmark) ? "\uE019\n" : "\n", sizeof Cursor - 1);
-                strncat(MultiplierStr, ("[" + m_outline[i].label + "]\n").c_str(), sizeof MultiplierStr - 1);
+                SafeCat(Cursor, sizeof Cursor, (i == m_outline_index && !m_cursor_on_bookmark) ? "\uE019\n" : "\n");
+                SafeCat(MultiplierStr, sizeof MultiplierStr, ("[" + m_outline[i].label + "]\n").c_str());
             }
             return;
         }
         if (m_AttributeDumpBookmark->size() == 0) m_cursor_on_bookmark = false;
         m_show_only_enabled_cheats = false;
         getcheats();
-        strncat(BookmarkLabels, CheatsLabelsStr, sizeof BookmarkLabels - 1);
-        strncat(Cursor, CheatsCursor, sizeof Cursor - 1);
-        strncat(MultiplierStr, CheatsEnableStr, sizeof MultiplierStr - 1);
+        // Append the cheat columns onto the (already header+bookmark-filled)
+        // shared buffers using remaining capacity, never sizeof-1.
+        SafeCat(BookmarkLabels, sizeof BookmarkLabels, CheatsLabelsStr);
+        SafeCat(Cursor, sizeof Cursor, CheatsCursor);
+        SafeCat(MultiplierStr, sizeof MultiplierStr, CheatsEnableStr);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos, HidAnalogStickState leftJoyStick, HidAnalogStickState rightJoyStick) override {
@@ -1733,14 +2341,21 @@ public:
         }
 
         dmntchtHasCheatProcess(&(m_debugger->m_dmnt));
-        if (!m_debugger->m_dmnt) {
+        // Bookmark value editing is modal: while engaged, none of the guards
+        // below may hijack input. They call tsl::goBack() on B, and because
+        // MainMenu is the root Gui that hides/closes the whole overlay — which
+        // is exactly why pressing B during editing quit the overlay (instead of
+        // deleting a character) whenever the cheat process momentarily reported
+        // absent or the cheat count dropped to 0. Gate them on !m_edit_value so
+        // execution always reaches the m_edit_value handler further down.
+        if (!m_edit_value && !m_debugger->m_dmnt) {
             if (keysDown & HidNpadButton_B) {
                 tsl::goBack();
             }
             return true;
         }
 
-		if (!m_cheatCnt) {
+		if (!m_edit_value && !m_cheatCnt) {
             if (keysDown & HidNpadButton_B) {
                 tsl::goBack();
             }
@@ -1749,11 +2364,41 @@ public:
 
         static u32 keycode;
         u32 redirect_index = m_cheat_index + m_cheatlist_offset;
-        if (m_outline_mode) redirect_index = m_cheat_outline[redirect_index].index;
-        for (auto entry : m_toggle_list) {
+        if (!m_edit_value && m_outline_mode) {
+            // m_cheat_outline is rebuilt on refresh and can be shorter than
+            // the raw cheat count (collapsed groups). Clamp before indexing;
+            // if there is nothing to point at, ignore this input frame.
+            if (m_cheat_outline.empty()) return true;
+            if (redirect_index >= m_cheat_outline.size())
+                redirect_index = (u32)m_cheat_outline.size() - 1;
+            redirect_index = m_cheat_outline[redirect_index].index;
+        } else if (!m_edit_value) {
+            // Non-outline flat view: redirect_index must be the raw index of the
+            // highlighted REAL cheat. m_flat_row_raw[] already excludes section
+            // markers, so resolve through it rather than treating
+            // m_cheat_index + m_cheatlist_offset as a raw m_cheats offset (which
+            // drifts onto a marker or the wrong cheat once rows are hidden).
+            u32 r = FlatSelectedRaw();
+            if (r == 0xFFFFFFFFu)
+                return true;
+            redirect_index = r;
+        }
+        for (const auto &entry : m_toggle_list) {
             if (((keysHeld | keysDown) == entry.keycode) && (keysDown & entry.keycode)) {
-                dmntchtToggleCheat(entry.cheat_id);
-                refresh_cheats = true;
+                // Same live-id resolution as BookmarkOverlay: cheat_id from the
+                // .bz1 file or even from a previous refresh can be stale after
+                // edits that re-add cheats.
+                u32 live_id = 0;
+                bool ambiguous = false;
+                if (LookupCheatIdByName(entry.name, &live_id, &ambiguous)) {
+                    dmntchtToggleCheat(ambiguous ? entry.cheat_id : live_id);
+                    save_toggles_to_file = true;
+                    refresh_cheats = true;
+                } else if (entry.name[0] == 0) {
+                    dmntchtToggleCheat(entry.cheat_id);
+                    save_toggles_to_file = true;
+                    refresh_cheats = true;
+                }
             }
         }
         if (m_editCheat) {
@@ -1763,10 +2408,20 @@ public:
             if (keycount > 0) return true;
             m_editCheat = false;
             if (m_get_toggle_keycode) {
-                toggle_list_t entry;
+                toggle_list_t entry = {};
                 entry.cheat_id = m_cheats[redirect_index].cheat_id;
                 entry.keycode = keycode;
+                // Persist the stable name alongside the (volatile) cheat_id so
+                // that subsequent AddCheat/RemoveCheat cycles don't strand this
+                // entry on a wrong cheat.
+                std::memcpy(entry.name, m_cheats[redirect_index].definition.readable_name, sizeof(entry.name));
+                entry.name[sizeof(entry.name) - 1] = 0;
                 m_toggle_list.push_back(entry);
+                // New user-assigned toggle combo: mark the .bz1 dirty so the
+                // self-describing header + persisted name actually reach disk on
+                // exit. Without this the save path never ran and load fell back to
+                // the legacy 8-byte reader, dropping name/stride.
+                save_breeze_toggle_to_file = true;
                 m_get_toggle_keycode = false;
             } else if (m_get_action_keycode) {
                 breeze_action_list_t entry;
@@ -1775,12 +2430,25 @@ public:
                 entry.breeze_action = Set;
                 entry.freeze_value._u16 = 10;
                 m_breeze_action_list.push_back(entry); // temp test code
+                save_breeze_action_to_file = true;     // persist the .bz2 on exit
                 m_get_action_keycode = false;
             } else {
                 if ((m_cheats[redirect_index].definition.opcodes[0] & 0xF0000000) == 0x80000000) {
                     m_cheats[redirect_index].definition.opcodes[0] = keycode;
                 } else {
-                    if (m_cheats[redirect_index].definition.num_opcodes < 0x100 + 2) {
+                    // opcodes[] is a fixed uint32_t[0x100] (DmntCheatDefinition).
+                    // This branch prepends two words (a key-combo word + a
+                    // 0x20000000 separator, shifting the existing ones up), so it
+                    // needs room for num_opcodes + 2 within the real array.
+                    // MaximumProgramOpcodeCount (0x400) is the dmnt IPC budget,
+                    // NOT the array size; the old bound `num_opcodes < 0x100 + 2`
+                    // let num_opcodes reach 0x101, so opcodes[num_opcodes + 1] and
+                    // the shift loop wrote past opcodes[0x100] and corrupted the
+                    // neighbouring DmntCheatEntry in the m_cheats heap array.
+                    constexpr u32 opcodeCap =
+                        static_cast<u32>(sizeof(m_cheats[redirect_index].definition.opcodes) /
+                                         sizeof(m_cheats[redirect_index].definition.opcodes[0]));
+                    if (m_cheats[redirect_index].definition.num_opcodes + 2 <= opcodeCap) {
                         m_cheats[redirect_index].definition.opcodes[m_cheats[redirect_index].definition.num_opcodes + 1] = 0x20000000;
 
                         for (u32 i = m_cheats[redirect_index].definition.num_opcodes; i > 0; i--) {
@@ -1812,7 +2480,7 @@ public:
                 return true;
             }
             if (keysDown & HidNpadButton_Plus) {
-                searchValue_t searchValue;
+                searchValue_t searchValue = {0};
                 if (m_hex_mode == false)
                     switch (m_selected_type) {
                         case SEARCH_TYPE_FLOAT_32BIT:
@@ -1885,7 +2553,7 @@ public:
                             searchValue._u64 = std::strtoul(valueStr.c_str(), NULL, 16);
                             break;
                     }
-                m_debugger->writeMemory(&searchValue, dataTypeSizes[m_selected_type], m_selected_address);
+                m_debugger->writeMemory(&searchValue, DataTypeSize(m_selected_type), m_selected_address);
                 m_edit_value = false;
                 return true;
             }
@@ -1910,7 +2578,7 @@ public:
             };
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuChangeToBookmarkCombo)) {
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuChangeToBookmarkCombo)) {
             TeslaFPS = 20;
             IsFrameBackground = false;
             tsl::hlp::requestForeground(false);
@@ -1926,12 +2594,16 @@ public:
             if (save_breeze_action_to_file) save_breeze_action();
             save_breeze_action_to_file = false;
             m_cheatlist_offset_save = m_cheatlist_offset;
+            // A Gui transition happened; stop here. Without this return the same
+            // frame kept falling through the rest of MainMenu::handleInput, so the
+            // Y in Y+ZL also fired the plain-Y "find next enabled" handler.
+            return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuIncreaseFontSizeCombo)) { // font size++
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuIncreaseFontSizeCombo)) { // font size++
             fontsize++;
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuDecreaseFontSizeCombo)) { // font size--
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuDecreaseFontSizeCombo)) { // font size--
             fontsize--;
             return true;
         }
@@ -1963,47 +2635,108 @@ public:
             }
             return true;
         }
-        if (keysDown & HidNpadButton_X && !(isInKeyComboList(keysHeld, keysDown))) { // force switch to outline mode
+        // Lone X toggles the "show all within outline" view. isInKeyComboList only
+        // knows defined combos, so an undefined pair like ZR+X would otherwise
+        // leak in here and jump m_cheatlist_offset out of range (emptying the
+        // list). Require that no shoulder/trigger key is held, so only a clean
+        // X press acts (X+ZL is still routed to the outline-mode combo below).
+        if (keysDown & HidNpadButton_X && !(isInKeyComboList(keysHeld, keysDown))
+            && !((keysDown | keysHeld) & (HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL | HidNpadButton_ZR))) { // force switch to outline mode
             if (m_outline_mode) return true;
             if (m_outline.size() > 1) {
                 m_showALlCheats = !m_showALlCheats;
+                if (m_outline_index >= m_outline.size()) m_outline_index = m_outline.size() - 1;
                 m_cheatlist_offset = m_outline[m_outline_index].index;
+                if (m_cheatlist_offset >= (u32)m_cheatCnt) m_cheatlist_offset = 0;
                 m_cheat_index = 0;
             }
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuOutlineModeSwitchesCombo)) { // switch to outline/non-outline mode
+        // Switch outline/non-outline mode. isKeyComboJustPressed is edge-triggered
+        // (fires once when a combo member goes down), so holding ZL+X can no longer
+        // flip m_outline_mode every frame.
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuOutlineModeSwitchesCombo)) { // switch to outline/non-outline mode
             m_outline_mode = !m_outline_mode;
             if (m_outline_mode) {
+                // Entering outline. The saved position was captured the last
+                // time we left outline; in between, m_cheat_outline may have
+                // shrunk (group collapsed, cheat deleted, master toggle
+                // flipped), so the saved offset/row can be past the end and
+                // the render loop's `line + m_cheatlist_offset >= size`
+                // check breaks on line 0 -- the user sees an empty list until
+                // they nudge the cursor. Clamp to the current size.
                 m_showALlCheats = true;
-                m_cheat_index = m_cheat_index_save;
-                m_cheatlist_offset = m_cheatlist_offset_save;
+                u32 size = (u32)m_cheat_outline.size();
+                if (size == 0) {
+                    m_cheat_index = 0;
+                    m_cheatlist_offset = 0;
+                } else {
+                    u32 off = m_cheatlist_offset_save;
+                    if (off >= size) off = size - 1;
+                    u32 visible = size - off;
+                    if (visible > (u32)NUM_cheats) visible = (u32)NUM_cheats;
+                    u32 row = m_cheat_index_save;
+                    if (row >= visible) row = visible - 1;
+                    m_cheatlist_offset = off;
+                    m_cheat_index = row;
+                }
             } else {
+                // Entering flat: stash the outline position and jump the flat
+                // base to the raw index of the currently-highlighted outline
+                // entry. If the raw is somehow out of range, fall back to the
+                // top; the pre-pass additionally recovers from a base landing
+                // on a trailing marker (empty window -> reset to 0).
                 m_cheat_index_save = m_cheat_index;
                 m_cheatlist_offset_save = m_cheatlist_offset;
                 m_cheat_index = 0;
-                m_cheatlist_offset = redirect_index;
+                m_cheatlist_offset = (redirect_index < (u32)m_cheatCnt) ? redirect_index : 0;
             }
             return true;
         }
         if (keysDown & HidNpadButton_Y) {  //find next enabled cheat
+            // Remember whether we were already in the flat view. If we were,
+            // m_flat_row_raw reflects the currently-displayed window and we can
+            // just move the cursor there without re-scrolling. If we're coming
+            // from outline mode, the map is stale/empty until the next
+            // getcheats() rebuild, so always scroll.
+            bool was_flat = !m_outline_mode;
             m_show_outline = false;
             m_outline_mode = false;
             m_cursor_on_bookmark = false;
             m_showALlCheats = true;
-            if ((m_cheat_index + m_cheatlist_offset) >= m_cheatCnt - 1) {
-                m_cheat_index = 0;
-                m_cheatlist_offset = 0;
-                if (m_cheats[m_cheat_index + m_cheatlist_offset].enabled) return true;
+            if (m_cheatCnt == 0) return true;
+            // Resolve the currently highlighted real cheat, then wrap-scan the raw
+            // array for the next enabled one. Markers are skipped explicitly (they
+            // are bookkeeping, never enabled).
+            u32 cur = FlatSelectedRaw();
+            u32 start = (cur == 0xFFFFFFFFu) ? 0 : cur;
+            u32 found = 0xFFFFFFFFu;
+            for (u32 step = 1; step <= (u32)m_cheatCnt; step++) {
+                u32 idx = (u32)(((u64)start + step) % m_cheatCnt);
+                if (IsSectionBegin(m_cheats[idx]) || IsSectionEnd(m_cheats[idx])) continue;
+                if (m_cheats[idx].enabled) { found = idx; break; }
             }
-            do {
-                if ((m_cheat_index < NUM_cheats - 1) && ((m_cheat_index + m_cheatlist_offset) < m_cheatCnt - 1))
-                    m_cheat_index++;
-                else if ((m_cheat_index + m_cheatlist_offset) < m_cheatCnt - 1)
-                    m_cheatlist_offset++;
-                else
-                    break;
-            } while (!m_cheats[m_cheat_index + m_cheatlist_offset].enabled);
+            if (found != 0xFFFFFFFFu) {
+                // Gentler jump-to-next-enabled: when the target is already visible
+                // in the current window, only move the cursor to its row (no view
+                // re-scroll). If it's off-screen, scroll the view so the target
+                // lands on the first row. Without this, consecutive Y presses
+                // within the same screen visibly "snap" the whole list up each
+                // time, and with only one enabled cheat the list appears to jump
+                // even though the highlighted item doesn't change.
+                u32 rowOfFound = 0xFFFFFFFFu;
+                if (was_flat) {
+                    for (u32 r = 0; r < m_flat_row_count; r++) {
+                        if (m_flat_row_raw[r] == found) { rowOfFound = r; break; }
+                    }
+                }
+                if (rowOfFound != 0xFFFFFFFFu) {
+                    m_cheat_index = rowOfFound;
+                } else {
+                    m_cheatlist_offset = found;
+                    m_cheat_index = 0;
+                }
+            }
             return true;
         }
         if (keysDown & HidNpadButton_B) { // exit outline mode or exit the overlay
@@ -2017,7 +2750,7 @@ public:
             if (save_code_to_file) {
                 savetoggles();
                 dumpcodetofile();
-                for (u8 i = 0; i < m_cheatCnt; i++) {
+                for (u32 i = 0; i < m_cheatCnt; i++) {
                     dmntchtRemoveCheat(m_cheats[i].cheat_id);
                 }
             }
@@ -2058,8 +2791,8 @@ public:
             }
             return true;
         }
-        if ((keysDown & HidNpadButton_A) && m_cursor_on_bookmark) { // remove cheat item
-            valueStr = _getAddressDisplayString(m_selected_address, m_debugger, m_selected_type);
+        if ((keysDown & HidNpadButton_A) && m_cursor_on_bookmark) { // enter bookmark value editing
+            valueStr = _getAddressDisplayString(m_selected_address, m_debugger.get(), m_selected_type);
             value_pos = valueStr.length();
             m_edit_value = true;
             return true;
@@ -2069,46 +2802,60 @@ public:
             return true;
         }
         if ((keysDown & HidNpadButton_Minus) && m_cursor_on_bookmark) { // remove bookmark
-            deletebookmark();
-            if (((m_index >= NUM_bookmark) || ((m_index + m_addresslist_offset) >= (m_AttributeDumpBookmark->size() / sizeof(bookmark_t) ))) && m_index > 0) m_index--;
-            return true;
-        }
-        if ((keysDown & HidNpadButton_Minus) && !m_cursor_on_bookmark && m_outline_mode) { // remove cheat
-            auto outline_entry = m_cheat_outline[m_cheat_index + m_cheatlist_offset];
-            if (outline_entry.is_outline && !outline_entry.always_expanded) {
-                for (auto i = outline_entry.index; i <= outline_entry.index + outline_entry.size; i++)
-                    dmntchtRemoveCheat(m_cheats[i].cheat_id);
-            } else
-                dmntchtRemoveCheat(m_cheats[outline_entry.index].cheat_id);
-            m_outline_refresh = true;
-            refresh_cheats = true;
-            getcheats();
-            save_code_to_file = true;
-            m_cheatlist_offset = 0;
-            m_cheat_index = 0;
-            while (m_cheat_index + m_cheatlist_offset + 1 < m_cheat_outline.size()) {
-                if (m_cheat_outline[m_cheat_index + m_cheatlist_offset + 1].index > redirect_index) break;
-                if (m_cheat_index + 1 < m_NUM_cheats)
-                    m_cheat_index++;
-                else
-                    m_cheatlist_offset++;
+            // Only walk the cursor up when a bookmark was actually removed;
+            // deletebookmark() returns false on its empty/out-of-range guards,
+            // and in that case the list is unchanged and the cursor must not move.
+            if (deletebookmark()) {
+                if (((m_index >= NUM_bookmark) || ((m_index + m_addresslist_offset) >= (m_AttributeDumpBookmark->size() / sizeof(bookmark_t) ))) && m_index > 0) m_index--;
             }
             return true;
         }
-        if ((keysDown & HidNpadButton_Minus) && !m_cursor_on_bookmark && !m_outline_mode) { // remove cheat
-            dmntchtRemoveCheat(m_cheats[redirect_index].cheat_id);
-            m_outline_refresh = true;
-            refresh_cheats = true;
-            getcheats();
-            save_code_to_file = true;
-            m_cheatlist_offset_save = 0;
-            m_cheat_index_save = 0;
-            while (m_cheat_index_save + m_cheatlist_offset_save + 1 < m_cheat_outline.size()) {
-                if (m_cheat_outline[m_cheat_index_save + m_cheatlist_offset_save + 1].index > redirect_index) break;
-                if (m_cheat_index_save + 1 < m_NUM_cheats)
-                    m_cheat_index_save++;
-                else
-                    m_cheatlist_offset_save++;
+        // Cheat deletion is destructive: the exit path's dumpcodetofile() rewrites
+        // the .txt library from the remaining set. A timestamped .txt.bak is written
+        // before that rewrite as a last-resort restore point (see dumpcodetofile).
+        if ((keysDown & HidNpadButton_Minus) && !m_cursor_on_bookmark) { // remove cheat
+            if (m_outline_mode) {
+                if (m_cheat_outline.empty()) return true;
+                u32 oi = m_cheat_index + m_cheatlist_offset;
+                if (oi >= m_cheat_outline.size()) oi = (u32)m_cheat_outline.size() - 1;
+                auto outline_entry = m_cheat_outline[oi];
+                if (outline_entry.is_outline && !outline_entry.always_expanded) {
+                    for (auto i = outline_entry.index; i <= outline_entry.index + outline_entry.size; i++)
+                        dmntchtRemoveCheat(m_cheats[i].cheat_id);
+                } else
+                    dmntchtRemoveCheat(m_cheats[outline_entry.index].cheat_id);
+                // Structure changed: cheat indices shift, so drop remembered
+                // expansion rather than re-apply it onto the wrong sections.
+                m_expanded_groups.clear();
+                m_outline_refresh = true;
+                refresh_cheats = true;
+                getcheats();
+                save_code_to_file = true;
+                m_cheatlist_offset = 0;
+                m_cheat_index = 0;
+                while (m_cheat_index + m_cheatlist_offset + 1 < m_cheat_outline.size()) {
+                    if (m_cheat_outline[m_cheat_index + m_cheatlist_offset + 1].index > redirect_index) break;
+                    if (m_cheat_index + 1 < m_NUM_cheats)
+                        m_cheat_index++;
+                    else
+                        m_cheatlist_offset++;
+                }
+            } else {
+                dmntchtRemoveCheat(m_cheats[redirect_index].cheat_id);
+                m_expanded_groups.clear();
+                m_outline_refresh = true;
+                refresh_cheats = true;
+                getcheats();
+                save_code_to_file = true;
+                m_cheatlist_offset_save = 0;
+                m_cheat_index_save = 0;
+                while (m_cheat_index_save + m_cheatlist_offset_save + 1 < m_cheat_outline.size()) {
+                    if (m_cheat_outline[m_cheat_index_save + m_cheatlist_offset_save + 1].index > redirect_index) break;
+                    if (m_cheat_index_save + 1 < m_NUM_cheats)
+                        m_cheat_index_save++;
+                    else
+                        m_cheatlist_offset_save++;
+                }
             }
             return true;
         }
@@ -2136,7 +2883,10 @@ public:
             return true;
         }
         if ((keysDown & HidNpadButton_AnyDown) || (keysHeld & HidNpadButton_StickRDown)) { // navigate down
-            u32 m_cheatlineCnt = (m_outline_mode) ? m_cheat_outline.size() : m_cheatCnt;
+            // Outline: logical row into m_cheat_outline. Flat: the last real cheat
+            // (marker-free), NOT the raw m_cheatCnt -- m_cheatCnt counts section
+            // markers, so using it let the cursor scroll past the final cheat.
+            u32 m_cheatlineCnt = (m_outline_mode) ? m_cheat_outline.size() : m_last_real_raw + 1;
             if (m_cursor_on_bookmark) {
                 if ((m_index < NUM_bookmark - 1) && ((m_index + m_addresslist_offset) < (m_AttributeDumpBookmark->size() / sizeof(bookmark_t) - 1))) m_index++;
                 else if (m_cheatlineCnt > 0)
@@ -2156,7 +2906,7 @@ public:
             }
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuSetBookmarkMultipier) && m_cursor_on_bookmark) { // set bookmark multipier
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuSetBookmarkMultipier) && m_cursor_on_bookmark) { // set bookmark multipier
             bookmark_t bookmark;
             m_AttributeDumpBookmark->getData((m_index + m_addresslist_offset) * sizeof(bookmark_t), &bookmark, sizeof(bookmark_t));
             if (bookmark.magic!=0x1289) bookmark.multiplier = 1;
@@ -2209,42 +2959,54 @@ public:
         if ((keysDown & HidNpadButton_A) && m_cheatCnt > 0 && !m_cursor_on_bookmark) { //*** toggle cheats / expand outline
             u32 index = m_cheat_index + m_cheatlist_offset;
             if (m_outline_mode) {
+                if (m_cheat_outline.empty()) return true;
+                if (index >= m_cheat_outline.size()) index = (u32)m_cheat_outline.size() - 1;
                 auto entry = m_cheat_outline[index];
-                if (entry.is_outline && !entry.always_expanded) {
-                        if (!entry.expanded) {
-                            for (u32 i = 1; i <= entry.size; i++) {
-                                cheat_outline_entry_t new_entry = {};
-                                new_entry.index = entry.index + i;
-                                m_cheat_outline.insert(m_cheat_outline.begin() + index + i, new_entry);
-                            }
-                            entry.expanded = true;
-                        } else {
-                            m_cheat_outline.erase(m_cheat_outline.begin() + index + 1, m_cheat_outline.begin() + index + 1 + entry.size);
-                            entry.expanded = false;
-                        }
-                        m_cheat_outline[index] = entry;
+                if (entry.is_outline) {
+                    // A group header is a --SectionStart marker (a no-op cheat): A
+                    // only expands/collapses it and must never toggle the marker
+                    // itself (that would flip a phantom cheat and bump the enabled
+                    // count). Expansion is recorded in m_expanded_groups and the
+                    // outline is rebuilt from it, so a collapsed group can never
+                    // keep a stale child row (e.g. one just enabled) visible.
+                    if (!entry.always_expanded) {
+                        if (entry.expanded)
+                            std::erase(m_expanded_groups, entry.index);
+                        else
+                            m_expanded_groups.push_back(entry.index);
+                        m_outline_refresh = true;
                         refresh_cheats = true;
-                        return true;
+                    }
+                    return true;
                 }
                 index = entry.index;
-            } else if (m_cheats[index].definition.opcodes[0] == 0x20000000) {
-                if (m_outline.size() > 1)
-                    m_show_outline = true;
-                return true;
+            } else {
+                // Flat view: resolve the highlighted real cheat through the row
+                // map, which already excludes section markers, so A can never land
+                // on (or toggle) a marker row.
+                index = FlatSelectedRaw();
+                if (index == 0xFFFFFFFFu)
+                    return true;
             }
+            // Safety net: never toggle a section marker.
+            if (IsSectionBegin(m_cheats[index]) || IsSectionEnd(m_cheats[index])) return true;
             if (m_cheats[index].enabled)
                 dmntchtToggleCheat(m_cheats[index].cheat_id);
             else {
                 if (m_cheats[index].definition.num_opcodes + total_opcode <= MaximumProgramOpcodeCount)
                     dmntchtToggleCheat(m_cheats[index].cheat_id);
             }
+            save_toggles_to_file = true;
             refresh_cheats = true;
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuNextLabel)) {  // Next label
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuNextLabel)) {  // Next label
             if (m_outline_mode) {
                 auto i = m_cheat_index + m_cheatlist_offset;
-                while (i < m_cheat_outline.size()) {
+                // The old loop tested `i < size` and then did `i++` before
+                // indexing, so when the cursor was at the last outline it read
+                // m_cheat_outline[size] (out of bounds). Bound on i+1 instead.
+                while (i + 1 < m_cheat_outline.size()) {
                     i++;
                     if (m_cheat_outline[i].is_outline) {
                         m_cheatlist_offset = i - m_cheat_index;
@@ -2254,7 +3016,7 @@ public:
             }
             return true;
         }
-        if (isKeyComboPressed(keysHeld, keysDown, mainMenuPreviousLabel)) {  // Previous label
+        if (isKeyComboJustPressed(keysHeld, keysDown, mainMenuPreviousLabel)) {  // Previous label
             if (m_outline_mode) {
                 auto i = m_cheat_index + m_cheatlist_offset;
                 while (i > 0) {
@@ -2338,8 +3100,9 @@ class MonitorOverlay : public tsl::Overlay {
                 "GameNotRunningMainMenuListItemText": "Game not running",
                 "NoDmntMainMenuListItemText": "Dmnt not attached",
                 "UpdateCursorNoCheatsMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\n\n\n",
-                "UpdateCursorOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090 nav\n\uE0A4 \uE0A5 Change  \uE0A0 Edit  \uE0A1 Exit  \uE0A6+\uE0A4/\uE0A5 Font size  \uE0B4 Deletet\n\uE0A6+\uE04E Toggle show all cheats  \uE0A3 Find next enabled cheat\n",
-                "UpdateCursorNotOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090\uE0A4\uE0A5 nav\n\uE0A0 Toggle  \uE0B3 Add bookmark  \uE0B4 Delete bookmark  \uE0A1 Exit\n\n",
+                "UpdateCursorOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090 nav\n\uE0A4 \uE0A5 Change  \uE0A0 Edit  \uE0A1 Exit  \uE0A6+\uE0A4/\uE0A5 Font size  \uE0B4 Delete\n\uE0A6+\uE04E Toggle show all cheats  \uE0A3 Find next enabled cheat\n",
+                "UpdateCursorNotOnBookmarkMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\uE092\uE093\uE091\uE090\uE0A4\uE0A5 nav\n\uE0A0 Toggle  \uE0B3 Add bookmark  \uE0B4 Delete (irreversible)  \uE0A1 Exit  \uE0A6+\uE0A4/\uE0A5 Font size\n\uE0A6+\uE04E Toggle show all cheats  \uE0A3 Find next enabled cheat\n",
+                "UpdateEditValueHeaderMainMenuCustomDrawerText": "%s v%s\nPID: %03ld TID: %016lX BID: %02X%02X%02X%02X%02X%02X%02X%02X\n\n\n\n",
                 "UpdateBookmarkPressKeyForComboCountMainMenuCustomDrawerText": "Press key for combo count = %d\n",
                 "UpdateEditCheatValueMainMenuCustomDrawerText": "\uE092\uE093\uE0A4\uE0A5 \uE0A0 Select, \uE0A1 Backspace, \uE045 Enter, \uE0A2 Cancel\n",
                 "UpdateShowOutlineCursorMainMenuCustomDrawerText": "Cheats outline \uE092\uE093 \uE0A0 Select\n"

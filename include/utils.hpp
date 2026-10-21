@@ -14,20 +14,23 @@
 using IniData = std::map<std::string, std::map<std::string, std::string>>;
 
 // default key combo
-std::string strBookmarkEnableCheatCombo = "LSTICK+RSTICK";
-std::string strBookmarkPauseCheatCombo = "Y+ZL";
-std::string strBookmarkIncreaseFontSizeCombo = "R+ZL";
-std::string strBookmarkDecreaseFontSizeCombo = "L+ZL";
+// NOTE: these are defined at namespace scope in a header. Marking them
+// `inline` (C++17 inline variables) keeps a single definition across all
+// translation units that include this header, avoiding ODR violations.
+inline std::string strBookmarkEnableCheatCombo = "LSTICK+RSTICK";
+inline std::string strBookmarkPauseCheatCombo = "Y+ZL";
+inline std::string strBookmarkIncreaseFontSizeCombo = "R+ZL";
+inline std::string strBookmarkDecreaseFontSizeCombo = "L+ZL";
 
-std::string strMainMenuChangeToBookmarkCombo = "Y+ZL";
-std::string strMainMenuIncreaseFontSizeCombo = "R+ZL";
-std::string strMainMenuDecreaseFontSizeCombo = "L+ZL";
-std::string strMainMenuOutlineModeSwitchesCombo = "X+ZL";
-std::string strMainMenuSetBookmarkMultipier = "L+R";
-std::string strMainMenuNextLabel = "R+ZR";
-std::string strMainMenuPreviousLabel = "L+ZR";
+inline std::string strMainMenuChangeToBookmarkCombo = "Y+ZL";
+inline std::string strMainMenuIncreaseFontSizeCombo = "R+ZL";
+inline std::string strMainMenuDecreaseFontSizeCombo = "L+ZL";
+inline std::string strMainMenuOutlineModeSwitchesCombo = "X+ZL";
+inline std::string strMainMenuSetBookmarkMultipier = "L+R";
+inline std::string strMainMenuNextLabel = "R+ZR";
+inline std::string strMainMenuPreviousLabel = "L+ZR";
 
-std::vector<std::string> split(const std::string& str, char delim = ' ') {
+inline std::vector<std::string> split(const std::string& str, char delim = ' ') {
     std::vector<std::string> out;
     std::size_t current, previous = 0;
     current = str.find(delim);
@@ -40,13 +43,18 @@ std::vector<std::string> split(const std::string& str, char delim = ' ') {
     return out;
 }
 
-IniData parseIni(const std::string &str) {
+inline IniData parseIni(const std::string &str) {
     IniData iniData;
     auto lines = split(str, '\n');
     std::string lastHeader = "";
     for (auto& line : lines) {
         line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
 
+        // After whitespace stripping a blank/comment line can be empty;
+        // indexing line[0]/line[size-1] on an empty string is UB, so skip.
+        if (line.empty()) {
+            continue;
+        }
         if (line[0] == '[' && line[line.size() - 1] == ']') {
             lastHeader = line.substr(1, line.size() - 2);
             iniData.emplace(lastHeader, std::map<std::string, std::string>{});
@@ -59,19 +67,19 @@ IniData parseIni(const std::string &str) {
 }
 
 // String formatting functions
-void removeSpaces(std::string& str) {
+inline void removeSpaces(std::string& str) {
 	str.erase(std::remove(str.begin(), str.end(), ' '), str.end());
 }
 
-void convertToUpper(std::string& str) {
+inline void convertToUpper(std::string& str) {
 	std::transform(str.begin(), str.end(), str.begin(), ::toupper);
 }
 
-void convertToLower(std::string& str) {
+inline void convertToLower(std::string& str) {
 	std::transform(str.begin(), str.end(), str.begin(), ::tolower);
 }
 
-void formatButtonCombination(std::string& line) {
+inline void formatButtonCombination(std::string& line) {
 	std::map<std::string, std::string> replaces{
 		{"A", "\uE0E0"},
 		{"B", "\uE0E1"},
@@ -133,8 +141,12 @@ void formatButtonCombination(std::string& line) {
 	}	
 }
 
-uint64_t MapButtons(const std::string& buttonCombo) {
-	std::map<std::string, uint64_t> buttonMap = {
+inline uint64_t MapButtons(const std::string& buttonCombo) {
+	// static const so the lookup table is built exactly once per process
+	// instead of on every call. MapButtons is invoked from the per-frame
+	// input hot path, and previously each call heap-allocated a 24-entry
+	// std::map.
+	static const std::map<std::string, uint64_t> buttonMap = {
 		{"A", HidNpadButton_A},
 		{"B", HidNpadButton_B},
 		{"X", HidNpadButton_X},
@@ -170,18 +182,49 @@ uint64_t MapButtons(const std::string& buttonCombo) {
 	size_t max_delimiters = 4;
 	while ((pos = comboCopy.find(delimiter)) != std::string::npos) {
 		button = comboCopy.substr(0, pos);
-		if (buttonMap.find(button) != buttonMap.end()) {
-			comboBitmask |= buttonMap[button];
+		if (auto it = buttonMap.find(button); it != buttonMap.end()) {
+			comboBitmask |= it->second;
 		}
 		comboCopy.erase(0, pos + delimiter.length());
 		if (!--max_delimiters) {
 			return comboBitmask;
 		}
 	}
-	if (buttonMap.find(comboCopy) != buttonMap.end()) {
-		comboBitmask |= buttonMap[comboCopy];
+	if (auto it = buttonMap.find(comboCopy); it != buttonMap.end()) {
+		comboBitmask |= it->second;
 	}
 	return comboBitmask;
+}
+
+// Pre-parsed key-combo bitmasks. MapButtons() walks a std::map for every
+// token, and the overlay input code used to call it on every frame for every
+// combo. These caches are recomputed only when the combo strings change (once,
+// at the end of ParseIniFile), turning the per-frame hot path into pure
+// integer bitmask compares.
+inline uint64_t g_bookmarkEnableCheatCombo = 0;
+inline uint64_t g_bookmarkPauseCheatCombo = 0;
+inline uint64_t g_bookmarkIncreaseFontSizeCombo = 0;
+inline uint64_t g_bookmarkDecreaseFontSizeCombo = 0;
+inline uint64_t g_mainMenuChangeToBookmarkCombo = 0;
+inline uint64_t g_mainMenuIncreaseFontSizeCombo = 0;
+inline uint64_t g_mainMenuDecreaseFontSizeCombo = 0;
+inline uint64_t g_mainMenuOutlineModeSwitchesCombo = 0;
+inline uint64_t g_mainMenuSetBookmarkMultipier = 0;
+inline uint64_t g_mainMenuNextLabel = 0;
+inline uint64_t g_mainMenuPreviousLabel = 0;
+
+inline void RefreshKeyComboMasks() {
+	g_bookmarkEnableCheatCombo        = MapButtons(strBookmarkEnableCheatCombo);
+	g_bookmarkPauseCheatCombo         = MapButtons(strBookmarkPauseCheatCombo);
+	g_bookmarkIncreaseFontSizeCombo   = MapButtons(strBookmarkIncreaseFontSizeCombo);
+	g_bookmarkDecreaseFontSizeCombo   = MapButtons(strBookmarkDecreaseFontSizeCombo);
+	g_mainMenuChangeToBookmarkCombo   = MapButtons(strMainMenuChangeToBookmarkCombo);
+	g_mainMenuIncreaseFontSizeCombo   = MapButtons(strMainMenuIncreaseFontSizeCombo);
+	g_mainMenuDecreaseFontSizeCombo   = MapButtons(strMainMenuDecreaseFontSizeCombo);
+	g_mainMenuOutlineModeSwitchesCombo = MapButtons(strMainMenuOutlineModeSwitchesCombo);
+	g_mainMenuSetBookmarkMultipier    = MapButtons(strMainMenuSetBookmarkMultipier);
+	g_mainMenuNextLabel               = MapButtons(strMainMenuNextLabel);
+	g_mainMenuPreviousLabel           = MapButtons(strMainMenuPreviousLabel);
 }
 
 /**
@@ -198,23 +241,45 @@ ALWAYS_INLINE bool isKeyComboPressed(u64 keysDown, u64 keysHeld, u64 comboBitmas
 }
 
 /**
+ * @brief 边沿触发版组合键判定：仅当组合键中至少有一个键“本帧新按下”时返回一次 true。
+ * isKeyComboPressed 是电平触发（只要还按着就每帧为真），对于 changeTo/goBack/模式
+ * 切换/字号/倍率这类一次性动作会导致按住时每帧重复触发（在两个 overlay 间反复横跳）。
+ * 参数顺序沿用调用点习惯：keysHeld 在前，keysDown（本帧新按下）在后。
+ *
+ * @param keysHeld 已持续按住超过1帧的按键（位掩码）
+ * @param keysDown 当前帧新按下的按键（位掩码）
+ * @param comboBitmask 目标组合键
+ * @return true 组合键完整且本帧有新按下的成员键；false 未满足或仅处于按住状态
+ */
+ALWAYS_INLINE bool isKeyComboJustPressed(u64 keysHeld, u64 keysDown, u64 comboBitmask) {
+	return isKeyComboPressed(keysHeld, keysDown, comboBitmask) &&
+		(keysDown & comboBitmask);
+}
+
+/**
  * @brief 检查在已知keysDown包含部分组合键的情况下，keysHeld是否包含剩余必要按键
  * 
  * @param keysDown 当前帧新按下的键（已知包含组合键中的部分按键）
  * @param keysHeld 已持续按住超过1帧的键
  * @return true 组合键的所有按键要么在keysDown中，要么在keysHeld中（组合完整）；false 不完整
  */
-ALWAYS_INLINE bool isInKeyComboList(const u64 keysDown, const u64 keysHeld) {
-    return (keysHeld & (MapButtons(strMainMenuChangeToBookmarkCombo) & ~keysDown)) == (MapButtons(strMainMenuChangeToBookmarkCombo) & ~keysDown) ||
-		(keysHeld & (MapButtons(strMainMenuIncreaseFontSizeCombo) & ~keysDown)) == (MapButtons(strMainMenuIncreaseFontSizeCombo) & ~keysDown) ||
-		(keysHeld & (MapButtons(strMainMenuDecreaseFontSizeCombo) & ~keysDown)) == (MapButtons(strMainMenuDecreaseFontSizeCombo) & ~keysDown) ||
-		(keysHeld & (MapButtons(strMainMenuOutlineModeSwitchesCombo) & ~keysDown)) == (MapButtons(strMainMenuOutlineModeSwitchesCombo) & ~keysDown) ||
-		(keysHeld & (MapButtons(strMainMenuSetBookmarkMultipier) & ~keysDown)) == (MapButtons(strMainMenuSetBookmarkMultipier) & ~keysDown) ||
-		(keysHeld & (MapButtons(strMainMenuNextLabel) & ~keysDown)) == (MapButtons(strMainMenuNextLabel) & ~keysDown) ||
-		(keysHeld & (MapButtons(strMainMenuPreviousLabel) & ~keysDown)) == (MapButtons(strMainMenuPreviousLabel) & ~keysDown);
+inline bool isInKeyComboList(const u64 keysDown, const u64 keysHeld) {
+    // Use the pre-parsed masks instead of calling MapButtons() 14 times per
+    // invocation. The masks are refreshed once at startup (ParseIniFile) and
+    // only change if the combo strings are reloaded.
+    const u64 notDown = ~keysDown;
+    uint64_t m;
+    m = g_mainMenuChangeToBookmarkCombo & notDown;  if ((keysHeld & m) == m) return true;
+    m = g_mainMenuIncreaseFontSizeCombo & notDown;  if ((keysHeld & m) == m) return true;
+    m = g_mainMenuDecreaseFontSizeCombo & notDown;  if ((keysHeld & m) == m) return true;
+    m = g_mainMenuOutlineModeSwitchesCombo & notDown; if ((keysHeld & m) == m) return true;
+    m = g_mainMenuSetBookmarkMultipier & notDown;   if ((keysHeld & m) == m) return true;
+    m = g_mainMenuNextLabel & notDown;              if ((keysHeld & m) == m) return true;
+    m = g_mainMenuPreviousLabel & notDown;          if ((keysHeld & m) == m) return true;
+    return false;
 }
 
-void ParseIniFile() {
+inline void ParseIniFile() {
 	std::string overlayName;
 	std::string directoryPath = "sdmc:/config/" APPTITLE "/";
 	std::string configIniPath = directoryPath + "keycombo.ini";
@@ -297,4 +362,9 @@ void ParseIniFile() {
 			}
 		}
 	}
+
+	// Recompute the cached bitmasks from the (possibly default) combo strings.
+	// Always runs, even when keycombo.ini is absent, so the masks reflect the
+	// built-in defaults.
+	RefreshKeyComboMasks();
 }

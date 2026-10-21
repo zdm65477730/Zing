@@ -51,7 +51,9 @@ u64 Debugger::getRunningApplicationPID() {
 }
 
 u64 Debugger::peekMemory(u64 address) {
-    u64 out;
+    // Initialize to 0: if the underlying read fails (dmnt/svc returns an
+    // error), the previous code returned an indeterminate stack value.
+    u64 out = 0;
     if (m_dmnt)
         dmntchtReadCheatProcessMemory(address, &out, sizeof(u64));
     else {
@@ -107,7 +109,7 @@ MemoryInfo Debugger::queryMemory(u64 address) {
     if (m_dmnt)
         dmntchtQueryCheatProcessMemory(&memInfo, address);
     else {
-        u32 pageinfo; // ignored
+        u32 pageinfo = 0; // ignored, but must not be passed uninitialized
         svcQueryDebugProcessMemory(&memInfo, &pageinfo, m_debugHandle, address);
     }
 

@@ -1,25 +1,10 @@
 #include "memory_dump.hpp"
 #include <stdio.h>
-#include "lz.h"
 #include "config.hpp"
-//
-// #include "guis/gui_cheats.hpp"
-
-// #include <sstream>
-// #include <limits>
-// #include <utility>
 
 #include <bits/stdc++.h>
-// #include <thread>
 
-// #include "helpers/util.h"
-
-// #include "edizon_logo_bin.h"
-//
-
-// Hacked to ignore error be useless should be extern
-
-#define BUFFER_SIZE 0x5000 // file buffer size test increase from 1M to 2M gets 10% improvement
+#define BUFFER_SIZE 0x5000 // file buffer size
 
 bool print_details = false;
 
@@ -33,17 +18,13 @@ MemoryDump::MemoryDump(std::string filePath, DumpType dumpType, bool discardFile
     m_dataHeader.searchRegion = SEARCH_REGION_NONE;
     Config::readConfig();
     m_edizon_dir = Config::getConfig()->edizon_dir;
-    // if (filePath.compare("/switch/EdiZon/memdump1.dat") == 0 || filePath.compare("/switch/EdiZon/memdump1a.dat") == 0
-    // || (Config::getConfig()->separatebookmark && (filePath.compare("/switch/EdiZon/memdumpbookmark.dat") == 0 )))
-    {
-        filePath.replace(0, sizeof(EDIZON_DIR) - 1, m_edizon_dir);
-        m_filePath = filePath;
-        printf("%s\n", filePath.c_str());
-    }
+    // Remap the hard-coded EdiZon path to the user-configured dump directory.
+    // (Originally gated by a filename compare; now applied to every dump.)
+    filePath.replace(0, sizeof(EDIZON_DIR) - 1, m_edizon_dir);
+    m_filePath = filePath;
     if (filePath.compare("/switch/EdiZon/datadump2.dat") == 0) {
         filePath.replace(0, sizeof(EDIZON_DIR) - 1, m_edizon_dir);
         m_filePath = filePath.append(m_store_extension);
-        printf("%s\n", filePath.c_str());
     }
     m_dumpFile = fopen(filePath.c_str(), "r");
     if (m_dumpFile == nullptr) {
@@ -61,7 +42,8 @@ MemoryDump::MemoryDump(std::string filePath, DumpType dumpType, bool discardFile
             if (fileSize >= sizeof(DataHeader))
             {
                 fseek(m_dumpFile, 0, SEEK_SET);
-                fread(&m_dataHeader, sizeof(m_dataHeader), 1, m_dumpFile);
+                size_t rd = fread(&m_dataHeader, sizeof(m_dataHeader), 1, m_dumpFile);
+                (void)rd;
             }
         }
     }
@@ -117,17 +99,12 @@ void MemoryDump::addData(u8 *buffer, size_t dataSize) {
 
             MemoryDump::flushBuffer();
 
-            fseek(m_dumpFile, 0, SEEK_END); // read shouldn't this come after flushbuffer??
-            if (m_compress) {
-                // u8 *cbuffer = new u8[BUFFER_SIZE * 9 / 8 + 4];
-                // *(u32 *)&cbuffer[0] = LZ_Compress(buffer, &cbuffer[4], dataSize);
-                // fwrite(cbuffer, sizeof(u8), *(u32 *)&cbuffer[0], m_dumpFile);
-                u8 *cbuffer = new u8[m_data.size() * 9 / 8];
-                int csize = LZ_Compress(&m_data[0], cbuffer, m_data.size());
-                fwrite(cbuffer, sizeof(u8), csize, m_dumpFile);
-                delete [] cbuffer;
-            } else
-                fwrite(buffer, sizeof(u8), dataSize, m_dumpFile);
+            fseek(m_dumpFile, 0, SEEK_END); // append past whatever flushBuffer wrote
+            // The dormant LZ compression path (m_compress) was removed: it was
+            // never enabled, its 8-byte-block framing was unsafe for sizes that
+            // are not a multiple of 8, and the warm-up loop could overrun small
+            // buffers. Zing only ever writes raw dumps, so just append directly.
+            fwrite(buffer, sizeof(u8), dataSize, m_dumpFile);
             m_dataHeader.dataSize += dataSize;
             MemoryDump::writeHeader(); // Maybe implement this section directly to avoid extra flashbuffer, seek, writeheader
         }
@@ -156,38 +133,22 @@ void MemoryDump::clear() {
 
 int MemoryDump::getData(u64 addr, void *buffer, size_t bufferSize) {
     if (!isFileOpen()) {
-        // if (print_details)
-        //   printf("%s\n", "file not open");
         return 1;
     }
     MemoryDump::flushBuffer();
-    // if (print_details)
-    // printf("%s\n", "flush buffer OK");
     fseek(m_dumpFile, sizeof(struct DataHeader) + addr, SEEK_SET);
-    // if (print_details)
-    //   printf("%s\n", "fseek OK");
-    fread(buffer, sizeof(u8), bufferSize, m_dumpFile);
-    // if (print_details)
-    //   printf("%s\n", "read OK");
-    return 0;
+    size_t rd = fread(buffer, sizeof(u8), bufferSize, m_dumpFile);
+    return (rd == bufferSize) ? 0 : 1;
 }
 
 int MemoryDump::putData(u64 addr, void *buffer, size_t bufferSize) {
     if (!isFileOpen()) {
-        // if (print_details)
-        //   printf("%s\n", "file not open");
         return 1;
     }
     MemoryDump::flushBuffer();
-    // if (print_details)
-    // printf("%s\n", "flush buffer OK");
     fseek(m_dumpFile, sizeof(struct DataHeader) + addr, SEEK_SET);
-    // if (print_details)
-    //   printf("%s\n", "fseek OK");
-    fwrite(buffer, sizeof(u8), bufferSize, m_dumpFile);
-    // if (print_details)
-    //   printf("%s\n", "read OK");
-    return 0;
+    size_t wr = fwrite(buffer, sizeof(u8), bufferSize, m_dumpFile);
+    return (wr == bufferSize) ? 0 : 1;
 }
 
 u8 MemoryDump::operator[](u64 index) {
@@ -211,14 +172,8 @@ bool MemoryDump::isFileOpen() {
 void MemoryDump::flushBuffer() {
     if (m_data.size() > 0 && isFileOpen()) {
         fseek(m_dumpFile, 0, SEEK_END);
-        if (m_compress) {
-            u8 *cbuffer = new u8[m_data.size() * 9 / 8];
-            int csize = LZ_Compress(&m_data[0], cbuffer, m_data.size());
-            fwrite(cbuffer, sizeof(u8), csize, m_dumpFile);
-            delete [] cbuffer;
-            printf("mcompress\n");
-        } else
-            fwrite(&m_data[0], sizeof(u8), m_data.size(), m_dumpFile);
+        // Compression removed (see addData note): always raw append.
+        fwrite(&m_data[0], sizeof(u8), m_data.size(), m_dumpFile);
 
         m_dataHeader.dataSize += m_data.size();
 
@@ -230,8 +185,6 @@ void MemoryDump::flushBuffer() {
 
 void MemoryDump::writeHeader() {
     if (isFileOpen()) {
-        if (m_compress)
-            m_dataHeader.magic = 0x4E5A4665;
         fseek(m_dumpFile, 0, SEEK_SET);
         fwrite(&m_dataHeader, sizeof(m_dataHeader), 1, m_dumpFile);
         fflush(m_dumpFile);
